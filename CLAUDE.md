@@ -107,6 +107,16 @@ and the uncertainty timeline squeezes hours into a few minutes of trackbar.
 `inspectPoseFile` warns on any length mismatch, "entire video" scope clamps to
 `videoFrameCount()`, and `restorePredictions` trims out-of-range frames from
 older saved prediction files (in memory only — the file keeps its full data).
+Feature extraction takes `max_frames` per video (the video's frame count,
+recorded on the manifest the first time a video is opened) for the same reason.
+
+Note the boundary is the **video length**, not the last label: footage that was
+watched and deliberately left unlabeled is legitimate "other", so truncating at
+the final label would discard real negatives. `limit_to_labeled` exists as a
+cruder fallback but is off by default. And this only skews *training* when
+"other" is trained on at all — with **Exclude other** ticked (`exclude_other`),
+`RFActiveLearner` drops those rows entirely and the model is unaffected either
+way; the bound still saves extraction time and disk.
 
 **Labels are sparse on disk, dense in training.** `generateTrainingLabelCsv`
 writes a row only for in-bout frames. `pose_service.dense_targets_from_csv`

@@ -290,6 +290,15 @@ const applyLockedFps = () => {
 };
 
 const updateDurationDisplay = () => {
+  // Duration is the first point at which the video's frame count is knowable,
+  // so record it against the project here (see setVideoFrameCount).
+  try {
+    const pm = window.projectManager;
+    if (pm && pm.isActive() && currentVideoName) {
+      pm.setVideoFrameCount(currentVideoName, videoFrameCount());
+    }
+  } catch { /* project manager or helpers not ready yet */ }
+
   if (webcodecsMode && webcodecsDurationMs) {
     durationEl.textContent = formatTime(webcodecsDurationMs);
     return;
@@ -3671,6 +3680,11 @@ poseEl("poseExtract").addEventListener("click", async () => {
     id: pm.getVideoIdFromName(name),
     pose_path: getPosePathFor(name),
     label_path: pm.getVideoLabelsAbs(name),
+    // Bounds extraction to the footage this video actually shows. Known for any
+    // video that has been opened at least once; null otherwise, in which case
+    // the whole pose file is used (and the length warning covers the risk).
+    max_frames: (name === currentVideoName ? videoFrameCount() : 0)
+      || pm.getVideoFrameCount(name) || null,
   }));
 
   poseEl("poseLog").textContent = "";

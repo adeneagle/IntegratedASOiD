@@ -112,38 +112,59 @@ def test_extract_one_aligns_features_and_targets(dlc_csv, label_csv):
     assert set(np.unique(out["targets"])) == {0, 1, 2}
 
 
-def test_extract_one_stops_after_the_last_label(tmp_path, dlc_csv):
-    """A pose file tracking far past the reviewed footage must not flood the
-    training set with unreviewed 'other' rows (the 4-hour-pose / 6-minute-video
-    case, which produced a 99.8%-other dataset)."""
-    # Labels cover only the first 600 of 3000 frames.
-    label_path = tmp_path / "short_labels.csv"
-    lines = ["time,rearing"] + [f"{i},1" for i in range(0, 600)]
-    label_path.write_text("\n".join(lines), encoding="utf-8")
-
+def test_max_frames_bounds_extraction_to_the_video(dlc_csv, label_csv):
+    """A pose file tracking past the end of the video must not contribute frames
+    nobody could have reviewed (the 4-hour-pose / 6-minute-video case)."""
     out = pose_service.extract_one(
-        pose_path=dlc_csv, label_path=str(label_path), origin="deeplabcut",
-        bodyparts=BODYPARTS, class_names=["rearing", "other"], frames2integ=30,
+        pose_path=dlc_csv, label_path=label_csv, origin="deeplabcut",
+        bodyparts=BODYPARTS, class_names=["rearing", "grooming", "other"],
+        frames2integ=30, max_frames=600,
     )
     assert out["n_frames_total"] == 3000
-    assert out["n_frames"] <= 600 + out["bin_width"]
-    # Almost everything kept is a real label, not unreviewed filler.
-    other_code = 1
-    assert (out["targets"] == other_code).mean() < 0.1
+    assert out["n_frames"] == 600
+    assert out["features"].shape[0] <= 600 // out["bin_width"]
 
 
-def test_extract_one_can_keep_the_unlabeled_tail(tmp_path, dlc_csv):
+def test_no_max_frames_uses_the_whole_pose_file(dlc_csv, label_csv):
+    """Default must not silently drop data — the video length may be unknown."""
+    out = pose_service.extract_one(
+        pose_path=dlc_csv, label_path=label_csv, origin="deeplabcut",
+        bodyparts=BODYPARTS, class_names=["rearing", "grooming", "other"],
+        frames2integ=30,
+    )
+    assert out["n_frames"] == 3000
+    assert out["n_frames_total"] == 3000
+
+
+def test_unlabeled_but_reviewed_frames_still_count_as_other(tmp_path, dlc_csv):
+    """Footage that was watched and deliberately left unlabeled is legitimate
+    'other' — bounding by the video must not truncate at the last label."""
     label_path = tmp_path / "short_labels.csv"
-    lines = ["time,rearing"] + [f"{i},1" for i in range(0, 600)]
+    lines = ["time,rearing"] + [f"{i},1" for i in range(0, 300)]
     label_path.write_text("\n".join(lines), encoding="utf-8")
 
     out = pose_service.extract_one(
         pose_path=dlc_csv, label_path=str(label_path), origin="deeplabcut",
         bodyparts=BODYPARTS, class_names=["rearing", "other"], frames2integ=30,
-        limit_to_labeled=False,
+        max_frames=1200,   # the whole video was reviewed, only part was labeled
     )
-    assert out["n_frames"] == 3000
-    assert (out["targets"] == 1).mean() > 0.7   # dominated by unreviewed "other"
+    assert out["n_frames"] == 1200
+    other_code = 1
+    # The reviewed-but-unlabeled tail is kept as real negatives.
+    assert (out["targets"] == other_code).sum() > 20
+
+
+def test_limit_to_labeled_is_available_as_a_fallback(tmp_path, dlc_csv):
+    label_path = tmp_path / "short_labels.csv"
+    lines = ["time,rearing"] + [f"{i},1" for i in range(0, 300)]
+    label_path.write_text("\n".join(lines), encoding="utf-8")
+
+    out = pose_service.extract_one(
+        pose_path=dlc_csv, label_path=str(label_path), origin="deeplabcut",
+        bodyparts=BODYPARTS, class_names=["rearing", "other"], frames2integ=30,
+        limit_to_labeled=True,
+    )
+    assert out["n_frames"] <= 300 + out["bin_width"]
 
 
 def test_extract_one_without_labels_is_all_other(dlc_csv):

@@ -159,6 +159,24 @@
     return (entry && entry.pose) || null;
   }
 
+  // Remember how many frames a video has, recorded the first time it's opened.
+  // Feature extraction uses it to bound a pose file that tracks more footage
+  // than the video shows, so frames nobody could have reviewed don't become
+  // "other" training samples.
+  function setVideoFrameCount(videoName, nFrames) {
+    if (!activeProject || !nFrames || nFrames <= 0) return;
+    const entry = getVideoEntry(videoName);
+    if (entry && entry.n_frames !== nFrames) {
+      entry.n_frames = nFrames;
+      saveManifest();
+    }
+  }
+
+  function getVideoFrameCount(videoName) {
+    const entry = getVideoEntry(videoName);
+    return (entry && entry.n_frames) || null;
+  }
+
   // Absolute path to a video's extracted features for the given iteration.
   function getVideoFeaturesAbs(videoName, iterationDir) {
     if (!activeProject) return null;
@@ -448,6 +466,8 @@
     setVideoPath,
     setVideoPose,
     getVideoPose,
+    setVideoFrameCount,
+    getVideoFrameCount,
     getVideoEntry,
     getVideoIdFromName,
 

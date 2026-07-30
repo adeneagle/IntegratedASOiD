@@ -193,7 +193,8 @@ def extract_one(
     llh_value: float = 0.6,
     animals: list[str] | None = None,
     multi_animal: bool = False,
-    limit_to_labeled: bool = True,
+    max_frames: int | None = None,
+    limit_to_labeled: bool = False,
 ) -> dict:
     """Pose + labels for a single recording → aligned (features, targets)."""
     pose_array, is_3d, perc_rect = pose_io.load_and_filter(
@@ -203,20 +204,27 @@ def extract_one(
     n_frames_total = pose_array.shape[0]
     bin_width = idx.bin_width_from(frames2integ)
 
-    # Stop at the last labeled frame (plus a bin of context).
+    # Bound extraction to what could actually have been reviewed.
     #
-    # "Other" is supposed to mean "the annotator looked at this and it wasn't one
-    # of the behaviors". Frames past the final label mean only "nobody looked",
-    # and a pose file that tracks far more footage than was ever reviewed — a
-    # whole session's .h5 against a short review clip — turns that tail into tens
-    # of thousands of spurious negatives that swamp the real labels. Left in,
-    # a set with a couple of hundred labeled samples can end up 99.8% "other"
-    # and the classifier learns to say "other" and nothing else.
+    # `max_frames` is the video's frame count. Pose past the end of the video was
+    # never viewable, so it can't have been annotated — yet `dense_targets_from_csv`
+    # will happily label all of it "other", and a pose file tracking a whole
+    # session against a short review clip then contributes tens of thousands of
+    # negatives nobody ever looked at. (This only skews training when "other" is
+    # trained on; with "Exclude other" ticked those rows are dropped anyway. It
+    # always costs extraction time and disk, though.)
+    #
+    # The video length is the right boundary, not the last label: footage that
+    # was watched and deliberately left unlabeled IS legitimate "other", and
+    # truncating at the final label would throw those real negatives away.
+    # `limit_to_labeled` is the cruder fallback, off by default.
     n_frames = n_frames_total
-    if limit_to_labeled and label_path and os.path.exists(label_path):
+    if max_frames and max_frames > 0:
+        n_frames = min(n_frames, int(max_frames))
+    elif limit_to_labeled and label_path and os.path.exists(label_path):
         _names, frame_to_col = read_label_csv(label_path)
         if frame_to_col:
-            n_frames = min(n_frames_total, max(frame_to_col) + 1 + bin_width)
+            n_frames = min(n_frames, max(frame_to_col) + 1 + bin_width)
 
     pose_array = pose_array[:n_frames]
 
@@ -299,6 +307,7 @@ def start_extraction(
                     llh_value=llh_value,
                     animals=animals,
                     multi_animal=multi_animal,
+                    max_frames=video.get("max_frames"),
                 )
                 path = _features_path(project_dir, iteration_dir, video["id"])
                 np.savez_compressed(

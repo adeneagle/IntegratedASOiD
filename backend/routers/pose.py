@@ -43,6 +43,9 @@ class VideoSource(BaseModel):
     id: str
     pose_path: str
     label_path: Optional[str] = None
+    # The video's frame count, when the app knows it. Bounds extraction to
+    # footage that could actually have been reviewed.
+    max_frames: Optional[int] = None
 
 
 class ExtractRequest(BaseModel):
