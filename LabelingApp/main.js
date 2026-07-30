@@ -455,15 +455,18 @@ ipcMain.handle("project:open-dialog", async () => {
 
 ipcMain.handle("project:create", async (_event, payload) => {
   const { rootDir, name } = payload;
-  const subdirs = ["labels", "frames", "backgrounds",
-    path.join("models", "checkpoints"), path.join("models", "exports")];
+  // Pose files stay wherever the user keeps them (referenced by absolute path);
+  // everything the app generates lives under the project root.
+  const subdirs = ["labels", "predictions",
+    path.join("iteration-0", "features"),
+    path.join("models", "checkpoints")];
   for (const sub of subdirs) {
     await fs.mkdir(path.join(rootDir, sub), { recursive: true });
   }
   const manifest = {
     name: name || path.basename(rootDir),
     created: new Date().toISOString().slice(0, 10),
-    version: 1,
+    version: 2,
     behaviors: [],
     videos: [],
     preprocessing: {},

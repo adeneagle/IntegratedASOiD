@@ -1,208 +1,183 @@
-"""Tests for backend.services.training_service."""
+"""Tests for the training service: the AL loop, checkpoints, and cancellation."""
 
-import json
 import os
-import time
 
+import joblib
+import numpy as np
 import pytest
 
-from backend.services.training_service import (
-    get_task,
-    list_checkpoints,
-    read_all_metrics,
-    read_latest_metrics,
-    start_training,
-    stop_training,
-)
+from backend.services import pose_service, training_service
+from tests.conftest import BODYPARTS, FPS, wait_for
 
 
-# ── list_checkpoints ──────────────────────────────────────────────────────
-
-class TestListCheckpoints:
-    def test_finds_ckpt_files(self, tmp_path):
-        # Create some fake checkpoint files
-        ckpt_dir = tmp_path / "checkpoints"
-        ckpt_dir.mkdir()
-        (ckpt_dir / "epoch=5.ckpt").write_bytes(b"x" * 1024)
-        (ckpt_dir / "model.pt").write_bytes(b"y" * 2048)
-        (ckpt_dir / "readme.txt").write_text("not a checkpoint")
-
-        results = list_checkpoints([str(tmp_path)])
-        filenames = [r["filename"] for r in results]
-        assert "epoch=5.ckpt" in filenames
-        assert "model.pt" in filenames
-        assert "readme.txt" not in filenames
-
-    def test_returns_size_mb(self, tmp_path):
-        ckpt_dir = tmp_path / "ckpts"
-        ckpt_dir.mkdir()
-        data = b"x" * (1024 * 1024)  # 1 MB
-        (ckpt_dir / "big.ckpt").write_bytes(data)
-
-        results = list_checkpoints([str(tmp_path)])
-        assert len(results) == 1
-        assert results[0]["size_mb"] == 1.0
-
-    def test_empty_directory(self, tmp_path):
-        results = list_checkpoints([str(tmp_path)])
-        assert results == []
-
-    def test_nested_directories(self, tmp_path):
-        nested = tmp_path / "a" / "b" / "c"
-        nested.mkdir(parents=True)
-        (nested / "deep.ckpt").write_bytes(b"z" * 100)
-
-        results = list_checkpoints([str(tmp_path)])
-        assert len(results) == 1
-        assert results[0]["filename"] == "deep.ckpt"
+@pytest.fixture
+def extracted_project(tmp_path, dlc_csv, label_csv):
+    """A project with features already extracted for one video."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    task_id = pose_service.start_extraction(
+        project_dir=str(project),
+        videos=[{"id": "vid1", "pose_path": dlc_csv, "label_path": label_csv}],
+        origin="deeplabcut", bodyparts=BODYPARTS, framerate=FPS,
+    )
+    status = wait_for(lambda: pose_service.get_task(task_id)["status"])
+    assert status == "completed", pose_service.get_task(task_id).get("error")
+    return str(project)
 
 
-# ── read_latest_metrics ──────────────────────────────────────────────────
-
-class TestReadLatestMetrics:
-    def test_nonexistent_task(self):
-        result = read_latest_metrics("nonexistent-id")
-        assert result == {}
-
-    def test_task_without_metrics_file(self):
-        from backend.services.training_service import _tasks
-        _tasks["test-task"] = {
-            "status": "starting",
-            "metrics_path": "/nonexistent/metrics.jsonl",
-            "error": None,
-        }
-        result = read_latest_metrics("test-task")
-        assert result["status"] == "starting"
-
-    def test_reads_latest_line(self, tmp_path):
-        from backend.services.training_service import _tasks
-        metrics_file = tmp_path / "metrics.jsonl"
-        lines = [
-            json.dumps({"epoch": 0, "train_loss": 1.5}),
-            json.dumps({"epoch": 1, "train_loss": 0.8}),
-            json.dumps({"epoch": 2, "train_loss": 0.3}),
-        ]
-        metrics_file.write_text("\n".join(lines) + "\n")
-
-        _tasks["metrics-test"] = {
-            "status": "running",
-            "metrics_path": str(metrics_file),
-            "error": None,
-        }
-        result = read_latest_metrics("metrics-test")
-        assert result["epoch"] == 2
-        assert result["train_loss"] == 0.3
-        assert result["status"] == "running"
-
-    def test_error_detail_attached_when_metrics_exist(self, tmp_path):
-        """A run that errors after writing metrics still surfaces task['error']."""
-        from backend.services.training_service import _tasks
-        metrics_file = tmp_path / "metrics.jsonl"
-        metrics_file.write_text(json.dumps({"epoch": 0, "train_loss": 1.5}) + "\n")
-
-        _tasks["errored-test"] = {
-            "status": "error",
-            "metrics_path": str(metrics_file),
-            "error": "Traceback: boom",
-        }
-        result = read_latest_metrics("errored-test")
-        assert result["status"] == "error"
-        assert result["error"] == "Traceback: boom"
+def _train(project, **overrides):
+    config = {
+        "project_dir": project,
+        "video_ids": ["vid1"],
+        "iteration_dir": "iteration-0",
+        "init_ratio": 0.05,
+        "max_iter": 4,
+        "max_samples_iter": 20,
+        "conf_threshold": 0.6,
+        "exclude_other": False,
+        "checkpoint_dir": os.path.join(project, "models", "checkpoints"),
+        "model_name": "test_model",
+    }
+    config.update(overrides)
+    task_id = training_service.start_training(config)
+    status = wait_for(lambda: training_service.get_task(task_id)["status"])
+    return task_id, status
 
 
-# ── read_all_metrics ───────────────────────────────────────────────────────
+def test_training_completes_and_writes_a_checkpoint(extracted_project):
+    task_id, status = _train(extracted_project)
+    task = training_service.get_task(task_id)
+    assert status == "completed", task.get("error")
 
-class TestReadAllMetrics:
-    def test_returns_all_lines_in_order(self, tmp_path):
-        from backend.services.training_service import _tasks
-        metrics_file = tmp_path / "metrics.jsonl"
-        events = [
-            {"status": "starting", "message": "Loading data..."},
-            {"status": "starting", "message": "Loaded 100 samples."},
-            {"status": "training", "epoch": 0, "best_val_loss": 0.5, "stagnation_epochs": 0},
-        ]
-        metrics_file.write_text("\n".join(json.dumps(e) for e in events) + "\n")
-        _tasks["all-metrics-test"] = {"status": "training", "metrics_path": str(metrics_file)}
-
-        result = read_all_metrics("all-metrics-test")
-        assert len(result) == 3
-        assert [e.get("message") for e in result[:2]] == ["Loading data...", "Loaded 100 samples."]
-        assert result[2]["stagnation_epochs"] == 0
-
-    def test_nonexistent_task(self):
-        assert read_all_metrics("nope") == []
+    ckpt = task["checkpoint_path"]
+    assert ckpt and os.path.exists(ckpt)
+    assert ckpt.endswith(".joblib")
+    assert "test_model" in os.path.basename(ckpt)
 
 
-# ── stop_training ────────────────────────────────────────────────────────
+def test_checkpoint_records_everything_inference_needs(extracted_project):
+    task_id, status = _train(extracted_project)
+    assert status == "completed"
+    bundle = joblib.load(training_service.get_task(task_id)["checkpoint_path"])
 
-class TestStopTraining:
-    def test_nonexistent_task(self):
-        assert stop_training("nonexistent") is False
-
-    def test_already_finished_task(self):
-        from backend.services.training_service import _tasks
-        _tasks["done-task"] = {
-            "status": "completed",
-            "process": None,
-        }
-        assert stop_training("done-task") is False
+    # Without these, inference cannot reproduce the training feature space.
+    assert bundle["bodyparts"] == BODYPARTS
+    assert bundle["bodypart_fingerprint"]
+    assert bundle["frames2integ"] == 30
+    assert bundle["bin_width"] == 3
+    assert bundle["is_3d"] is False
+    assert bundle["class_names"][-1] == "other"
+    assert bundle["n_features"] == 16
+    assert hasattr(bundle["model"], "predict_proba")
 
 
-# ── start_training ────────────────────────────────────────────────────────
+def test_metrics_stream_has_ordered_startup_then_iterations(extracted_project):
+    task_id, status = _train(extracted_project)
+    assert status == "completed"
+    events = training_service.read_all_metrics(task_id)
 
-class TestStartTraining:
-    def test_returns_task_id(self, tmp_path):
-        config = {
-            "data_loading": {
-                "label_paths": ["/fake/labels.csv"],
-                "frame_dirs": ["/fake/frames"],
-                "frames_per_group": 3,
-            },
-            "data": {"train_percent": 0.7, "val_percent": 0.15, "test_percent": 0.15, "shuffle": False},
-            "model": {"num_frames": 3, "variant": "b0", "lr": 0.001},
-            "max_epochs": 1,
-            "callbacks": {"early_stopping_patience": 5},
-            "checkpoint_dir": str(tmp_path / "ckpts"),
-        }
-        task_id = start_training(config)
-        assert isinstance(task_id, str)
-        task = get_task(task_id)
-        assert task is not None
-        assert task["status"] in ("starting", "running", "error")
+    assert events, "metrics file should not be empty"
+    kinds = [e.get("event") for e in events]
+    assert "start" in kinds
+    assert "ceiling" in kinds
+    assert kinds.count("iteration") >= 1
+    # Startup messages must arrive before the first iteration.
+    assert kinds.index("start") < kinds.index("iteration")
 
-    def test_creates_temp_files(self, tmp_path):
-        config = {
-            "data_loading": {"label_paths": [], "frame_dirs": [], "frames_per_group": 3},
-            "data": {"train_percent": 0.7, "val_percent": 0.15, "test_percent": 0.15, "shuffle": False},
-            "model": {"num_frames": 3, "variant": "b0", "lr": 0.001},
-            "max_epochs": 1,
-            "callbacks": {"early_stopping_patience": 5},
-        }
-        task_id = start_training(config)
-        task = get_task(task_id)
-        assert os.path.exists(task["config_path"])
-        assert os.path.exists(task["metrics_path"])
+    iters = [e for e in events if e.get("event") == "iteration"]
+    for e in iters:
+        assert {"macro_f1", "f1_per_class", "n_train", "n_lowconf_remaining"} <= set(e)
+    # Iteration numbers are contiguous from 0.
+    assert [e["iteration"] for e in iters] == list(range(len(iters)))
 
-    def test_bad_config_results_in_error(self, tmp_path):
-        """Training with invalid data paths should fail gracefully."""
-        config = {
-            "data_loading": {
-                "label_paths": ["/totally/fake/path.csv"],
-                "frame_dirs": ["/totally/fake/frames"],
-                "frames_per_group": 3,
-            },
-            "data": {"train_percent": 0.7, "val_percent": 0.15, "test_percent": 0.15, "shuffle": False},
-            "model": {"num_frames": 3, "variant": "b0", "lr": 0.001},
-            "max_epochs": 1,
-            "callbacks": {"early_stopping_patience": 5},
-            "checkpoint_dir": str(tmp_path / "ckpts"),
-        }
-        task_id = start_training(config)
-        # Wait for subprocess to fail
-        for _ in range(100):
-            task = get_task(task_id)
-            if task["status"] in ("error", "completed"):
-                break
-            time.sleep(0.2)
-        assert task["status"] == "error"
-        assert task["error"] is not None
+
+def test_active_learning_uses_a_fraction_of_the_data(extracted_project):
+    task_id, status = _train(extracted_project)
+    assert status == "completed"
+    events = training_service.read_all_metrics(task_id)
+    start = next(e for e in events if e.get("event") == "start")
+    last = [e for e in events if e.get("event") == "iteration"][-1]
+    assert last["n_train"] < start["n_train"], "AL should train on a subset"
+
+
+def test_read_latest_metrics_reports_terminal_status(extracted_project):
+    task_id, _ = _train(extracted_project)
+    latest = training_service.read_latest_metrics(task_id)
+    assert latest["status"] == "completed"
+    assert "checkpoint_path" in latest
+
+
+def test_binarize_collapses_the_label_space(extracted_project):
+    task_id, status = _train(extracted_project, binarize="rearing")
+    task = training_service.get_task(task_id)
+    assert status == "completed", task.get("error")
+    bundle = joblib.load(task["checkpoint_path"])
+    assert bundle["class_names"] == ["other", "rearing"]
+
+
+def test_label_union_merges_behaviors_into_one_positive_class(extracted_project):
+    task_id, status = _train(extracted_project, label_union=["rearing", "grooming"])
+    task = training_service.get_task(task_id)
+    assert status == "completed", task.get("error")
+    bundle = joblib.load(task["checkpoint_path"])
+    assert bundle["class_names"] == ["other", "positive"]
+
+
+def test_training_errors_on_missing_features(tmp_path):
+    project = tmp_path / "empty"
+    (project / "iteration-0" / "features").mkdir(parents=True)
+    task_id, status = _train(str(project))
+    assert status == "error"
+    assert "feature" in training_service.get_task(task_id)["error"].lower()
+
+
+def test_stop_training_sets_the_cancel_flag(extracted_project):
+    task_id = training_service.start_training({
+        "project_dir": extracted_project,
+        "video_ids": ["vid1"],
+        "init_ratio": 0.05,
+        "max_iter": 500,          # long enough to still be running
+        "max_samples_iter": 1,
+        "conf_threshold": 0.9,
+        "checkpoint_dir": os.path.join(extracted_project, "models", "checkpoints"),
+    })
+    assert training_service.stop_training(task_id) is True
+    status = wait_for(lambda: training_service.get_task(task_id)["status"])
+    assert status == "cancelled"
+
+
+def test_stop_training_unknown_task_returns_false():
+    assert training_service.stop_training("not-a-task") is False
+
+
+def test_list_checkpoints_surfaces_metadata(extracted_project):
+    task_id, status = _train(extracted_project)
+    assert status == "completed"
+    found = training_service.list_checkpoints(
+        [os.path.join(extracted_project, "models")]
+    )
+    assert len(found) == 1
+    entry = found[0]
+    assert entry["filename"].endswith(".joblib")
+    assert entry["bodyparts"] == BODYPARTS
+    assert entry["class_names"][-1] == "other"
+    assert entry["frames2integ"] == 30
+
+
+def test_list_checkpoints_ignores_missing_dirs():
+    assert training_service.list_checkpoints(["/no/such/dir"]) == []
+
+
+def test_collapse_labels_is_a_noop_without_binarize():
+    y = np.array([0, 1, 2])
+    names = ["a", "b", "other"]
+    out_y, out_names = training_service._collapse_labels(y, names, None, None)
+    assert out_names == names
+    np.testing.assert_array_equal(out_y, y)
+
+
+def test_collapse_labels_ignores_unknown_behavior_names():
+    y = np.array([0, 1, 2])
+    names = ["a", "b", "other"]
+    _out_y, out_names = training_service._collapse_labels(y, names, "nonexistent", None)
+    assert out_names == names

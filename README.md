@@ -1,39 +1,64 @@
-# RealtimeASOID
+# A-SOID Desktop
 
-A desktop application for building **real-time, clip-based animal behavior classifiers** — from hand-labeling video through training to active-learning refinement.
+A desktop application for building **pose-based animal behavior classifiers** — from
+hand-labeling video through training to active-learning refinement.
 
-It pairs an Electron labeling UI with a Python (FastAPI + PyTorch Lightning) backend that handles video preprocessing, TSM model training, and per-frame inference. Trained models export to TorchScript for real-time deployment (e.g. Bonsai.ML rigs).
+It pairs an Electron labeling UI with a Python (FastAPI + scikit-learn) backend that
+turns pose-estimation files into spatio-temporal features, trains a RandomForest via
+[A-SOID](https://github.com/YttriLab/A-SOID)'s active-learning loop, and returns
+per-frame predictions with uncertainty.
+
+This is a fork of **RealtimeASOID**, which used a TSM convolutional network over
+cropped video frames. The labeling interface is inherited; the classifier is
+A-SOID's. That trade buys a **CPU-only install, training in seconds instead of
+hours, and a far smaller dependency stack** — at the cost of requiring pose
+tracking (DeepLabCut / SLEAP / OpenMonkeyStudio) as input.
 
 ---
 
 ## What it does
 
-A complete pipeline in one app, organized as four tabs:
+A complete pipeline in one app, organized as five tabs:
 
-1. **Label** — Load videos, define behaviors, and mark temporal *bouts* (start/end intervals) frame-by-frame.
-2. **Preprocess** — Background subtraction + animal-centered cropping → flat frame images for training.
-3. **Train** — Train a Temporal Shift Module (TSM) classifier on an EfficientNet backbone, with live metrics and optional Weights & Biases logging.
-4. **Active Learning** — Run inference, see an uncertainty heatmap and misclassification markers on the timeline, and jump to the frames most worth relabeling.
+1. **Label** — Load videos, define behaviors, and mark temporal *bouts* (start/end
+   intervals) frame-by-frame, with a frame-accurate player.
+2. **Pose** — Attach each video's pose file, pick which animals and body parts to
+   use, set the likelihood threshold and minimum behavior duration, and extract
+   features.
+3. **Train** — RandomForest with active learning: seed on a small fraction of each
+   class, then repeatedly add the samples the model is *least sure about* until it
+   stops being confused. Per-iteration F1 streams live.
+4. **Active Learning** — Run inference, see an uncertainty heatmap and
+   misclassification markers on the timeline, jump to the frames most worth
+   relabeling, and fix them in place. Optionally overlay the pose skeleton on the
+   video to see whether a bad prediction is really a tracking failure.
+5. **Predict** — Apply a trained model to unlabeled pose files in batch.
+
+The point of step 3 is that a small, well-chosen subset of labels usually matches or
+beats training on everything — and step 4 tells you which frames those are.
 
 ---
 
 ## Requirements
 
-- **[pixi](https://pixi.sh)** — manages the entire Python side (PyTorch+CUDA, ffmpeg, and the native stack) from a single lockfile. Install once:
+- **[pixi](https://pixi.sh)** — manages the entire Python side from a single
+  lockfile. Install once:
   - Windows (PowerShell): `iwr -useb https://pixi.sh/install.ps1 | iex`
   - macOS/Linux: `curl -fsSL https://pixi.sh/install.sh | bash`
 - **Node.js** 18+ (with `npm`) — for the Electron GUI.
-- A **CUDA GPU** is recommended for training/inference but not required (see CPU note below).
+- **No GPU.** The classifier is CPU-only scikit-learn; the environment installs and
+  runs identically on any machine.
 
-> You no longer install Python, PyTorch, CUDA, or ffmpeg yourself — `pixi` provisions a pinned, project-local environment from `pixi.toml`/`pixi.lock`, and the app discovers it automatically. (No more `conda create` / `RTASOID_PYTHON`.)
+> You don't install Python, scikit-learn, or ffmpeg yourself — `pixi` provisions a
+> pinned, project-local environment from `pixi.toml`, and the app discovers it
+> automatically.
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Python environment (creates .pixi/envs/default from pixi.toml + pixi.lock,
-#    pulling CUDA PyTorch + ffmpeg + deps from conda-forge). Run from repo root.
+# 1. Python environment (creates .pixi/envs/default from pixi.toml). Run from repo root.
 pixi install
 
 # 2. Electron app dependencies
@@ -41,207 +66,75 @@ cd LabelingApp
 npm install
 ```
 
-**CPU-only machine?** Edit `pixi.toml` and replace `pytorch-gpu` with `pytorch-cpu`, then re-run `pixi install`.
+---
 
 ## Running
 
 ```bash
-# From LabelingApp/ — launches the desktop app and auto-starts the backend
+cd LabelingApp
 npm start
 ```
 
-The Electron main process spawns the FastAPI backend (`uvicorn backend.server:app --port 8741`) using the **pixi env it auto-discovers** at `.pixi/envs/default/` (no env var needed), and shuts it down on exit. The header shows a **Backend** status pill (green = connected); `GET /api/health` reports the interpreter + CUDA status.
+Electron starts the backend automatically (`uvicorn backend.server:app --port 8741`)
+and shuts it down on exit. The header shows **Backend: Connected** once it's up.
 
-> **Interpreter resolution** (`main.js::resolveBackendPython`): `RTASOID_PYTHON`/`PYTHON` override → the project-local pixi env → bare `python` on PATH. The override is an advanced escape hatch; the normal path is the pixi env.
-
-To run the backend on its own (e.g. for API testing) or the tests:
-
-```bash
-pixi run backend     # uvicorn backend.server:app --port 8741 --host 127.0.0.1
-pixi run test        # pytest
-```
-
-## Building installers
-
-```bash
-cd LabelingApp
-npm run dist:win     # Windows (NSIS installer + portable)
-npm run dist:mac     # macOS (DMG)
-npm run dist:linux   # Linux (AppImage + deb)
-```
-
-> **Distribution status:** the dev/lab workflow above (`pixi install` → `npm start`) is the supported install today and needs no manual Python/CUDA setup. A fully turnkey end-user installer — bundling the `pixi` binary + backend source and running `pixi install` once on first launch (thin installer, ~no manual steps) — is the remaining packaging work tracked in the plan; until then, distribute by sharing the repo and having the recipient run `pixi install`.
+Standalone backend: `pixi run backend`. Tests: `pixi run test`.
 
 ---
 
-## Usage walkthrough
+## Input data
 
-### 1. Create or open a project
-A project is required. On launch a gate prompts you to **New Project** (choose a folder), **Open Project**, or **Import .rlt** — these are also in the header **Project ▾** menu. A project keeps your videos, labels, configs, frames, and models together (videos in `frames/<id>/`, backgrounds in `backgrounds/`) and auto-restores on next launch.
+Pose files, one per video:
 
-### 2. Add videos
-Click **+** in the **Videos** sidebar to add one or more video files. They appear in the sidebar; click one to load it.
+| Software | Format | Notes |
+|---|---|---|
+| DeepLabCut | `.csv` | single- or multi-animal |
+| SLEAP | `.h5` | analysis export; nodes sorted alphabetically |
+| OpenMonkeyStudio | `.mat` / `.txt` | 3D, single animal |
 
-> **Playback:** WebCodecs mode is on by default for true frame-accurate stepping and seeking. If a video's codec/container isn't supported (HEVC/H.265, AVI are common culprits), the app prompts you to either pick a different file or re-encode it to H.264 MP4.
-
-### 3. Define behaviors
-In the **Label** tab, add behaviors (e.g. *grooming*, *walking*). Each is auto-assigned a number key (`1`–`9`, `0`).
-
-### 4. Mark bouts
-Play or step through the video and press a behavior's number key **once to start** a bout and **again to end** it. Bouts appear in the scrollable list, where you can edit times, reassign behaviors, or jump to a bout's start/end.
-
-### 5. Preprocess
-In the **Preprocess** tab: compute a background, tune the crop preview, then run preprocessing. It extracts **only the labeled frames** (plus a short clip lead-in), cropped to the animal, into the project — so label first, then preprocess.
-
-### 6. Train
-In the **Train** tab: add data sources (frame dir + label CSV), set hyperparameters, and start training. Watch live loss/accuracy. Optionally enable **Weights & Biases** logging (project name, run name, and API key — the key is passed to the training process via environment variable and never written to disk). When a project is open, the best checkpoint is saved into it and recorded automatically.
-
-### 7. Infer & refine (Active Learning)
-In the **Active Learning** tab: select a checkpoint and run inference — it scores the **current video on the fly** (no frame directory needed), so it can flag uncertain regions you haven't labeled yet. A per-frame **uncertainty heatmap** (green → red) plus **misclassification markers** appear on the timeline. Jump to the next uncertain segment / misclassified frame, fix the label, and iterate.
+Videos are for viewing and labeling only — no pixels reach the classifier.
 
 ---
 
-## Keyboard shortcuts
+## Project layout
 
-| Key | Action |
-|-----|--------|
-| `1`–`9`, `0` | Start / end a bout for that behavior |
-| `Space` | Play / pause |
-| `←` / `→` | Step one frame back / forward |
-| `F` | Toggle fullscreen |
-| Drag trackbar | Scrub — jumps to that frame live (no need to press play) |
-
----
-
-## Projects & sharing (`.rlt` files)
-
-A project is a folder:
+Projects are self-contained directories with a `project.json` manifest:
 
 ```
 my_experiment/
-├── project.json     # manifest: videos, behaviors, configs, model refs
-├── labels/          # frame-indexed one-hot label CSVs per video
-├── frames/          # preprocessed frames (regenerable)
-├── backgrounds/     # computed backgrounds (regenerable)
-└── models/          # checkpoints + TorchScript exports
+├── project.json              # videos, pose paths, behaviors, config
+├── labels/                   # frame-indexed one-hot label CSVs
+├── iteration-N/features/     # extracted features per video
+├── predictions/              # saved inference results
+└── models/checkpoints/       # trained models (.joblib)
 ```
 
-Share a project as a single HDF5 `.rlt` file (modeled on SLEAP), in two flavors from **Project ▾**:
-
-- **Export .rlt (labels only)** — lightweight: manifest, behaviors, configs, video references, and your hand-labeled bouts. Small and emailable; regenerable data is excluded.
-- **Export Package .rlt (everything)** — self-contained bundle that also embeds preprocessed frames, backgrounds, and model checkpoints/exports. Large, but trains anywhere with no re-preprocessing.
-
-**Import** with **Project ▾ → Import .rlt** (auto-detects which flavor). On the new machine:
-
-| Item | Lightweight `.rlt` | Package `.rlt` |
-|------|--------------------|----------------|
-| **Labels & config** | Restored automatically | Restored automatically |
-| **Videos** | Referenced by path; re-link if it doesn't resolve | Same (videos aren't embedded) |
-| **Frames / backgrounds** | Re-run Preprocess | Restored from the file |
-| **Models** | Re-link the `.ckpt`, or re-train | Restored from the file |
+Video and pose paths are absolute (files stay where they are); everything else is
+relative to the project root. Projects export to a single HDF5 `.rlt` file in two
+flavors — lightweight (labels only) or package (everything, including the pose files
+themselves, so it trains anywhere).
 
 ---
 
-## Import / export formats
+## Iterating
 
-**Label CSV import** auto-detects two layouts:
+The human-in-the-loop cycle:
 
-- **Bout CSV** — header contains `start`, `end`, `behavior`:
-  ```csv
-  start,end,behavior
-  00:01.000,00:05.500,grooming
-  ```
-- **Frame-level matrix** — first column is frame index/time, remaining columns are 0/1 per behavior:
-  ```csv
-  time,grooming,walking,rearing
-  0,1,0,0
-  1,1,0,0
-  2,0,1,0
-  ```
+1. Label a modest amount of data.
+2. Extract features and train.
+3. In **Active Learning**, jump to the least-confident frames and fix the labels.
+4. Bump **Iteration** in the Pose tab, re-extract, and retrain.
 
-XLSX/XLS label files are also supported on import.
-
-**Export** produces a bout CSV or a one-hot frame-level CSV (optionally with a "fill" behavior for unlabeled frames). The **Import Video+Labels** action loads a video + label file from elsewhere directly into the current session.
+Each iteration keeps its own feature set under `iteration-N/`, so you can compare
+rounds rather than overwriting your history.
 
 ---
 
-## TorchScript export (real-time deployment)
+## Relationship to upstream A-SOID
 
-```python
-from convert_torchscript_tsm import export_model
-
-export_model(
-    checkpoint_path="lightning_logs/.../epoch=22.ckpt",
-    output_name="tsm_realtime",
-    output_dir="bonsai_models",
-    tsm_stages=[1, 2, 3, 4, 5, 6, 7],
-)
-```
-
-The resulting `.pt` is compatible with `Bonsai.ML.Torch`'s `LoadScriptModule` for real-time rig deployment.
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|--------|-----|
-| **Backend pill stays red** | Make sure you ran `pixi install` at the repo root; check the terminal for `[backend]` errors. The startup log prints the interpreter + torch/CUDA status. |
-| **Video won't load / "unsupported format"** | Choose a different MP4 (H.264) or WebM file, or use the prompt's *Re-encode* option (ffmpeg is provided by the pixi env). |
-| **WebCodecs unavailable** | The checkbox disables itself and falls back to HTML5 playback automatically. |
-| **Training is very slow** | Use a CUDA GPU; CPU works but is much slower. |
-| **Training runs on CPU despite having a GPU** | The training log shows `Device: CPU — GPU unavailable (...)` with the reason. With the default `pixi.toml` (`pytorch-gpu`) the env is CUDA-enabled; check `GET /api/health` → `device` to confirm the app is using the pixi env. If you edited `pixi.toml` to `pytorch-cpu`, switch it back and re-run `pixi install`. |
-
-### Selecting the backend Python interpreter (advanced)
-
-Normally the app auto-discovers the pixi env (`.pixi/envs/default/`). To force a different interpreter, set **`RTASOID_PYTHON`** (or `PYTHON`) before launching — it takes priority over the pixi env:
-
-```powershell
-# Windows (PowerShell)
-$env:RTASOID_PYTHON = "C:\path\to\python.exe"; cd LabelingApp; npm start
-```
-```bash
-# macOS / Linux
-export RTASOID_PYTHON="/path/to/python"; cd LabelingApp && npm start
-```
-
-The chosen interpreter is printed as `[backend] launching with interpreter: ...`, and `/api/health` reports its torch/CUDA status.
-
----
-
-## Testing
-
-The backend has a pytest suite using synthetic frames/videos — no GPU or real data needed:
-
-```bash
-pixi run test                          # all tests
-pixi run pytest -v                     # verbose
-pixi run pytest tests/test_rlt_service.py   # a single module
-```
-
-The Electron renderer UI is not covered by automated tests.
-
----
-
-## Repository layout
-
-```
-├── LabelingApp/        # Electron app (UI)
-│   ├── main.js         # main process — spawns the backend, IPC handlers
-│   ├── renderer.js     # all UI logic
-│   ├── preload.js      # contextBridge IPC
-│   ├── project-manager.js
-│   └── index.html / styles.css
-├── backend/            # FastAPI server (port 8741)
-│   ├── server.py
-│   ├── routers/        # preprocess, training, inference, project endpoints
-│   └── services/       # core logic incl. rlt_service.py (.rlt files)
-├── model.py            # EfficientNet classifier
-├── model_tsm.py        # TSM (Temporal Shift Module) variant
-├── convert_torchscript_tsm.py
-├── tune_cropping.py    # cropping/background utilities
-├── config_tsm.yaml     # training defaults
-└── tests/              # pytest suite
-```
-
-For architecture and contributor details, see [CLAUDE.md](CLAUDE.md).
+The numeric core (`backend/asoid_core/`) is vendored from
+[YttriLab/A-SOID](https://github.com/YttriLab/A-SOID) with Streamlit removed. The 2D
+feature extraction and the active-learning loop are arithmetically identical to
+upstream, so results are comparable with the reference Streamlit app. Three upstream
+issues were corrected during the port — a vestigial scaler, a `np.int` crash in the
+3D path, and a body-part stride bug in the same path. See `CLAUDE.md` for details.

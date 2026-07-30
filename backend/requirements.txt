@@ -1,20 +1,16 @@
+# pip fallback — pixi.toml is the authoritative dependency list.
 fastapi
 uvicorn[standard]
-torch
-torchvision
-lightning
-opencv-python-headless
-albumentations
-omegaconf
+scikit-learn<1.3
+numba>=0.52
+joblib
 numpy
 pandas
+scipy
 h5py
-wandb
-torchmetrics
-timm
+opencv-python-headless
 matplotlib
 pyyaml
-scipy
 
 # Dev / test dependencies
 pytest

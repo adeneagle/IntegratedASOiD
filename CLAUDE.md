@@ -2,205 +2,234 @@
 
 ## Project Overview
 
-Real-time clip-based animal behavior classifier. An Electron desktop app for labeling video with behavioral bouts, backed by a FastAPI server that handles video preprocessing, TSM model training (PyTorch Lightning), and per-frame inference with active learning.
+Pose-based animal behavior classifier with active learning. An Electron desktop
+app for labeling video with behavioral bouts, backed by a FastAPI server that
+extracts spatio-temporal features from pose-estimation files (DeepLabCut /
+SLEAP / OpenMonkeyStudio), trains a RandomForest through A-SOID's
+active-learning loop, and returns per-frame predictions with uncertainty.
+
+**This is a fork of RealtimeASOID** with the TSM convolutional network replaced
+by [A-SOID](https://github.com/YttriLab/A-SOID)'s random-forest + active-learning
+procedure. The labeling UI is inherited essentially intact; the classifier,
+feature pipeline and dependency stack are entirely different.
+
+### What changed from RealtimeASOID
+
+| | RealtimeASOID | A-SOID Desktop |
+|---|---|---|
+| Input | video pixels | pose files (x/y/likelihood per body part) |
+| Preprocess | background subtraction + crop + PNG frame dump | likelihood filter + binned pairwise features |
+| Model | TSM / EfficientNet (PyTorch Lightning, GPU) | RandomForest (scikit-learn, CPU) |
+| Training time | hours | seconds |
+| Deps | torch, lightning, timm, albumentations, wandb | scikit-learn, numba, joblib |
+| Checkpoint | `.ckpt` / TorchScript `.pt` | `.joblib` bundle |
+
+The Electron **Active Learning panel carries over unchanged** — the backend
+returns the identical `{frames: [{index, predicted_class, uncertainty}],
+class_names}` payload, so the uncertainty heatmap, misclassification ticks,
+jump-to-worst-frame and relabel strip all work as before.
 
 ## Project Structure
 
 ```
 ├── LabelingApp/           # Electron app (labeling UI)
 │   ├── main.js            # Main process — spawns Python backend
-│   ├── renderer.js        # Renderer process — all UI logic (~10K LOC)
+│   ├── renderer.js        # Renderer process — all UI logic (~5.4K LOC)
+│   ├── project-manager.js # Project manifest state
 │   ├── preload.js         # IPC bridge (contextBridge)
 │   └── index.html / styles.css
-├── backend/               # FastAPI REST server (port 8741)
+├── backend/
 │   ├── server.py          # App init + CORS
-│   ├── routers/           # preprocessing, training, inference endpoints
-│   └── services/          # Core logic (async tasks with cancellation)
-├── model.py               # EfficientNet-based classifier
-├── model_tsm.py           # TSM (Temporal Shift Module) variant
-├── convert_torchscript_tsm.py  # Export to TorchScript
-├── preprocess_video_train.py   # Video preprocessing CLI
-├── tune_cropping.py       # Crop parameter tuning
-├── config_tsm.yaml        # Training hyperparameters
-└── tests/                 # pytest suite (106 tests)
+│   ├── asoid_core/        # Vendored A-SOID numerics (Streamlit-free)
+│   │   ├── features.py        # numba feature extraction (2D + 3D)
+│   │   ├── pose_io.py         # DLC/SLEAP/OMS loaders + adp_filt
+│   │   ├── predict.py         # RF prediction, frame-shifted
+│   │   ├── active_learning.py # RFActiveLearner (the loop)
+│   │   └── indexing.py        # feature-row <-> native-frame mapping
+│   ├── routers/           # pose, training, inference, project
+│   └── services/          # pose, training, inference, rlt
+└── tests/                 # pytest suite (132 tests)
 ```
 
 ## Running the App
 
 ```bash
-# Python env (pixi.toml + pixi.lock → .pixi/envs/default, with CUDA torch + ffmpeg)
 pixi install
-
-# Install Node deps + launch Electron (auto-starts backend in the pixi env)
-cd LabelingApp
-npm install
-npm start
+cd LabelingApp && npm install && npm start
 ```
 
-The Electron main process spawns `uvicorn backend.server:app --port 8741` automatically and tears it down on exit. `main.js::resolveBackendPython()` resolves the interpreter in order: **`RTASOID_PYTHON`/`PYTHON` override → the project-local pixi env (`.pixi/envs/default/python.exe`) → bare `python`**. The pixi env is the supported path (no env var needed); the override is an advanced escape hatch. The chosen interpreter is logged as `[backend] launching with interpreter: ...`, and `GET /api/health` reports its torch/CUDA status (`device` block). `pixi.toml` is the source of truth for Python deps (`backend/requirements.txt` is a pip fallback). Standalone: `pixi run backend`, tests: `pixi run test`.
+Electron spawns `uvicorn backend.server:app --port 8741` automatically and tears
+it down on exit. `main.js::resolveBackendPython()` resolves the interpreter:
+**`RTASOID_PYTHON`/`PYTHON` override → project-local pixi env → bare `python`**.
+`GET /api/health` reports the interpreter plus numpy/sklearn/numba versions.
+Standalone backend: `pixi run backend`. Tests: `pixi run test`.
 
-## Running the Backend Standalone
+There is **no GPU dependency** — the environment installs and runs identically
+on any machine.
 
-```bash
-pixi run backend     # uvicorn backend.server:app --port 8741 --host 127.0.0.1
-```
+## Workflow Pipeline
 
-## Running Tests
+1. **Label** — load a video, define behaviors (keys 1-9, 0), mark temporal bouts.
+2. **Pose** — attach the video's pose file, pick animals/body parts, set the
+   likelihood threshold and minimum behavior duration, extract features into
+   `iteration-N/features/<video_id>.npz`.
+3. **Train** — RandomForest + active learning: seed on `init_ratio` of each
+   class, then repeatedly add the samples the model is least sure about
+   (`predict_proba.max(1) < conf_threshold`) until it stops being confused.
+   Per-iteration F1 streams into `#trainLog`. Saves a `.joblib` bundle.
+4. **Active Learning** — run inference on the pose file, get an uncertainty
+   heatmap on the timeline, jump to the least-confident frames, relabel in place.
+5. **Predict** — apply the model to unlabeled pose files in batch.
 
-```bash
-pixi run test                              # all tests
-pixi run pytest -v                         # verbose
-pixi run pytest tests/test_api_routers.py  # single module
-```
+Iterate by bumping the **Iteration** counter in the Pose tab: re-extract from
+the refined labels and retrain (A-SOID's `E_create_new_training`).
 
-Tests use synthetic frames/videos — no GPU or real data required. `pytest.ini` sets `asyncio_mode = auto`.
+## Critical invariants
 
-## Project Directory Structure
+**Frame indexing.** The UI indexes everything by native video frame. A-SOID's
+extractor works in *bins* of `bin_width = frames2integ // 10` native frames,
+where `frames2integ = round(framerate * min_duration / 0.1)`. All conversion
+lives in `asoid_core/indexing.py` — get it wrong and nothing errors, the
+heatmap just points at the wrong part of the video. It is unit-tested.
 
-Projects are saved as self-contained directories with a `project.json` manifest:
+**Body-part selection is part of the model.** Features are built from every
+*pair* of selected body parts (`nchoose2(n)*2 + n` columns), and column order
+follows the pose file's schema restricted to the selection. A model is only
+valid for the exact selection it was trained on. Checkpoints carry a
+`bodypart_fingerprint`; `inference_service.check_bodyparts` rejects a mismatch
+loudly. (Upstream A-SOID hit this — commit 1710d15.)
 
-```
-my_experiment/
-├── project.json              # manifest (videos, behaviors, config)
-├── labels/                   # auto-saved frame-indexed one-hot label CSVs per video
-├── frames/                   # preprocessed frames per video
-├── backgrounds/              # computed background images
-└── models/
-    ├── checkpoints/          # training checkpoints
-    └── exports/              # TorchScript exports
-```
+**Labels are sparse on disk, dense in training.** `generateTrainingLabelCsv`
+writes a row only for in-bout frames. `pose_service.dense_targets_from_csv`
+expands that to one class per frame with every unlabeled frame set to the *last*
+class, `other`. "Other" is trained on but never scored — it means "unlabeled",
+so counting it would inflate F1.
 
-- Video paths are **absolute** (stay where they are); all other paths are **relative** to project root
-- `project-manager.js` manages project state; `saveProgress()` dual-writes to both localStorage and project labels. The project label file is a **frame-indexed one-hot matrix** (`time` column = native frame index, one 0/1 column per behavior), generated by `generateTrainingLabelCsv()` — this is the exact format `model.py::load_data` consumes (it `argmax`es each row). Only in-bout frames get a row (sparse; lead-in/gap frames are context-only on disk, never labeled samples). The user-facing **Export bouts** button still writes the human-readable `start,end,behavior` timestamp CSV (`generateBoutsCsv`); import auto-detects either format and closes runs on frame-index gaps so the sparse matrix round-trips.
-- Project actions live in the header **Project ▾** dropdown; last project auto-restored on startup
-- **A project is required.** On startup, if none is active, a blocking gate overlay (`#projectGate`, shown/hidden by `updateProjectGate()`) offers New / Open / Import .rlt — the workspace is unusable until a project exists. (`localStorage` is still used as a per-video progress cache, but the app no longer runs in a standalone no-project mode.)
-- **Artifacts route into the project automatically:** Compute Background writes to `backgrounds/bg_<name>.png` and records the path on the video's manifest entry (auto-loaded when you switch videos); Preprocess writes **only labeled** frames to `frames/<id>/` named by native index (no manual output-directory setting). Active Learning needs no frame dir — it infers on the fly from the video.
-- **Training data sources** are a checklist of the project's videos (frames + labels resolved from the manifest); "Add External Source" remains for custom/out-of-project dirs.
+## Deviations from upstream A-SOID
 
-## .rlt File Format
+Documented inline as `UPSTREAM FIX` comments in `backend/asoid_core/`:
 
-Projects export to a single HDF5 `.rlt` file in **two flavors** (mirroring SLEAP's `.slp` vs `.pkg.slp`):
+1. **The `StandardScaler` is dropped.** Upstream fits one in
+   `feature_extraction()` then discards it — it saves and trains on *unscaled*
+   features and predicts via `bsoid_predict_numba_noscale`. It was vestigial;
+   a RandomForest is scale-invariant anyway.
+2. **`np.int` → `int`** in the 3D path (`extract_features_3D.py:187`), removed
+   in numpy ≥ 1.24. The 3D path could not run at all on modern numpy.
+3. **3D body-part stride fixed** from `index * 2` to `index * 3`. 3D pose stores
+   three coordinates per body part, so scaling an index by 2 made the kernels
+   read misaligned slices. Combined with (2), upstream's 3D path cannot have
+   produced a working model, so there was no numerical compatibility to preserve.
 
-- **Lightweight** (default, "Export .rlt (labels only)") — manifest + video references + hand-annotated label bouts. Small, shareable; frames/backgrounds/models are regenerated after import.
-- **Package** (`package=True`, "Export Package .rlt (everything)") — all of the above PLUS preprocessed frames (gzip), background images, and model checkpoints/exports. A self-contained, train-anywhere bundle (large).
-
-**HDF5 layout:**
-```
-/                               (attrs: rlt_version = 3, packaged)
-/                               (attr: manifest — JSON string with paths + config)
-/labels/{video_id}              (dataset: UTF-8 CSV string of bouts)
-/frames/{video_id}/{idx}        (dataset: uint8 PNG bytes, gzip)   [package only]
-/backgrounds/{video_id}         (dataset: uint8 PNG bytes, gzip)   [package only]
-/models/checkpoints/{name}      (dataset: uint8 blob)              [package only]
-/models/exports/{name}          (dataset: uint8 blob)              [package only]
-```
-
-- Video paths are preserved in the manifest; on import the app prompts to re-link any video whose path doesn't resolve (SLEAP-style)
-- `import_rlt` auto-detects which groups are present and restores accordingly (labels always; frames/backgrounds/models if packaged), writing `project.json` + the standard subdirs
-- Export/import goes through the backend (`/api/project/export-rlt` with `package` flag, `/api/project/import-rlt`, `/api/project/inspect-rlt`)
-- `rlt_service.py` handles all HDF5 read/write via `h5py`
+The 2D path is otherwise arithmetically identical to upstream, so F1
+trajectories are comparable with the reference Streamlit app.
 
 ## Key Patterns
 
-- **Behavior names**: normalized (trim + collapse internal whitespace, case-insensitive match) at every create/import/rename site; `mergeDuplicateBehaviors()` collapses existing duplicates on load. **Merge UI**: tick behavior rows + "Merge selected" → `mergeBehaviors(ids, targetId)` reassigns their bouts to one survivor (across the current video + all stored per-video progress via `reassignBoutsToBehavior`) and removes the rest (destructive).
-- **Async task management**: Services use background tasks with task IDs, progress callbacks, and cancellation support. Task registries are module-level dicts cleared between tests via `autouse` fixture.
-- **Pydantic v2**: `model_config` is a reserved field name — use `extra_model_config` instead.
-- **CSV import**: `parseCsvAndImport(content, sourceName)` is the reusable core; `importCsv()` and Import Project both delegate to it.
-- **Misclassification detection**: `buildMisclassifiedArray()` cross-references model predictions against user-labeled bouts. Hooked into `saveProgress()` with try-catch for TDZ safety (defined after `alState`). Compares in the model's label space via `mapLabelToModelClass()` — a binarized model predicts `['other', <positive>]`, so raw behavior names must be mapped first (returns null = "not comparable", never flagged).
-- **MKV / non-MP4 containers**: the frame-accurate WebCodecs path demuxes with mp4box (ISO/MP4 only), so MKV/WebM/AVI/etc. are remuxed to MP4 first (`remux-video` IPC → stream-copy, else H.264 re-encode; audio dropped; faststart). `loadWebcodecsFile` keeps `currentVideoName`/`currentFile` as the **original** — backend ops (preprocess/AL/export) read it via ffmpeg and need no remux; only the in-renderer decoder does. Stream-copy preserves frame count so native indices stay aligned.
-- **Model mocking in tests**: `monkeypatch.setattr(model_tsm.TSMClassifier, "load_from_checkpoint", ...)` with a `FakeModel` returning fixed logits.
+- **Task registries**: services use module-level `_tasks` dicts with
+  `status`/`progress`/`total`/`cancel`, cleared between tests by an `autouse`
+  fixture. Training cancels cooperatively (a flag the AL loop checks between
+  iterations) rather than by killing a subprocess.
+- **Metrics streaming**: training appends JSON-lines events; the SSE endpoint
+  replays *every* line in order (`read_all_metrics`) so nothing written between
+  polls is lost.
+- **Behavior names**: normalized (trim + collapse whitespace, case-insensitive)
+  at every create/import/rename site; `mergeDuplicateBehaviors()` collapses
+  duplicates on load.
+- **Binarize**: a checklist of behaviors — 0 ticked = multi-class, 1 = binarize
+  that behavior, ≥2 = union into one positive class. Handled by
+  `training_service._collapse_labels`, mirroring the TSM app's semantics so
+  `mapLabelToModelClass` in the renderer still applies.
+- **MKV / non-MP4 containers**: the frame-accurate WebCodecs path demuxes with
+  mp4box (ISO/MP4 only), so other containers are remuxed to MP4 first. The pose
+  file is unaffected — only the in-renderer decoder cares.
+- **Pose overlay**: drawn on its own `#poseCanvas` above both playback paths,
+  in the pose file's native pixel coordinates on a canvas sized to the video's
+  natural resolution, so `object-fit: contain` aligns it for free. Deliberately
+  shows *unfiltered* keypoints — the point is to reveal where tracking failed.
+
+## Project Directory Structure
+
+```
+my_experiment/
+├── project.json              # manifest (videos, pose paths, behaviors, config)
+├── labels/                   # frame-indexed one-hot label CSVs per video
+├── iteration-N/features/     # extracted features (.npz) per video
+├── predictions/              # saved AL inference results (.json)
+└── models/checkpoints/       # trained models (.joblib)
+```
+
+Video and pose paths are **absolute** (files stay where they are); everything
+else is relative to the project root.
 
 ## API Endpoints
 
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/api/health` | GET | Health check (used by Electron startup) |
-| `/api/preprocess/background` | POST | Compute background frame |
-| `/api/preprocess/preview` | POST | Preview cropped frame |
-| `/api/preprocess/run` | POST | Start video preprocessing |
-| `/api/preprocess/status/{task_id}` | GET | Preprocessing progress |
-| `/api/preprocess/stop/{task_id}` | POST | Stop preprocessing |
-| `/api/training/start` | POST | Start model training |
-| `/api/training/status/{task_id}` | GET | SSE stream of training metrics |
-| `/api/training/stop/{task_id}` | POST | Stop training |
-| `/api/training/checkpoints` | GET | List saved checkpoints |
-| `/api/training/export-torchscript` | POST | Export a `.ckpt` → TorchScript `.pt` (Train tab GUI button) |
-| `/api/inference/run` | POST | Start inference |
-| `/api/inference/status/{task_id}` | GET | Inference progress (SSE) |
-| `/api/inference/results/{task_id}` | GET | Fetch inference results |
-| `/api/inference/stop/{task_id}` | POST | Stop inference |
-| `/api/project/export-rlt` | POST | Pack project folder into .rlt |
-| `/api/project/import-rlt` | POST | Unpack .rlt into project folder |
-| `/api/project/inspect-rlt` | POST | Read .rlt metadata without extracting |
+| `/api/pose/inspect` | POST | Animals, body parts, frame count, 2D/3D |
+| `/api/pose/keypoints` | POST | Per-frame keypoints for the video overlay |
+| `/api/pose/extract-features` | POST | Start feature extraction |
+| `/api/pose/status/{id}` | GET | Extraction progress (SSE) |
+| `/api/pose/results/{id}` | GET | Per-video row/class counts |
+| `/api/pose/stop/{id}` | POST | Cancel extraction |
+| `/api/training/start` | POST | Start the active-learning loop |
+| `/api/training/status/{id}` | GET | SSE stream of per-iteration metrics |
+| `/api/training/stop/{id}` | POST | Stop training |
+| `/api/training/checkpoints` | GET | List `.joblib` models + their metadata |
+| `/api/inference/run` | POST | Per-frame inference on a pose file |
+| `/api/inference/batch` | POST | Batch predict over several pose files |
+| `/api/inference/status/{id}` | GET | Inference progress (SSE) |
+| `/api/inference/results/{id}` | GET | Predictions + uncertainty |
+| `/api/inference/stop/{id}` | POST | Cancel inference |
+| `/api/project/export-rlt` | POST | Pack project into .rlt |
+| `/api/project/import-rlt` | POST | Unpack .rlt |
+| `/api/project/inspect-rlt` | POST | Read .rlt metadata |
 
-## Workflow Pipeline
+## .rlt File Format
 
-1. **Label**: Load video in player, define behaviors (keys 1-9, 0), annotate temporal bouts.
-2. **Preprocess**: Video → optional **full-frame pre-resize** (`crop_params.resize_factor`, applied to the frame + background via `tune_cropping.pop_resize_factor`/`resize_frame`; the Preprocess panel shows the original vs processed frame size) → background subtraction (`crop_params.difference_mode`: "directional" = subject darker than bg, or "absolute" = |frame − bg|) → contour detection → center-of-mass crop, with temporal stabilization of the crop center (`crop_params.smoothing` EMA + `deadband` + `min_contour_area`/nearest-blob selection in `FindRatBoundingBox`) so the TSM classifier sees the animal's own motion rather than box jitter. The Preprocess panel can step frame-by-frame (Prev/Next), chaining the smoothed center so you can watch the box settle; `preview_frame` accepts/returns `center` for this. The same `resize_factor` is applied at inference (`run_inference_video`) so AL crops match training. Extracts **only labeled frames** (each bout expanded by `frames_per_group-1` lead-in for clip context), named by **native frame index**: `frames/<id>/<nativeIndex>.png`. The renderer computes the ranges from the video's bouts and sends `frame_ranges` to `/api/preprocess/run`.
-3. **Train**: Frame dirs + label CSVs → TSM classifier (EfficientNet backbone) → checkpoint in `lightning_logs/`. Optional W&B logging (project/run name, API key passed via env var to subprocess). **Binarize** is a checklist of behaviors: 0 checked = multi-class; 1 = binarize that behavior; ≥2 = combined into one positive class via `label_union` then binarized (renderer sends `binarize` + `label_union`). The subprocess emits **verbose startup lines** (device, data sources, sample/class counts, class distribution, train/val/test split) into the metrics JSONL; the SSE endpoint streams **every** line in order (`read_all_metrics`, not just the latest) so nothing is lost. The UI shows a scrollable `#trainLog`, plus **Best Val Loss** and **Stagnation** (`MetricsWriter` tracks `best_val_loss` and `stagnation_epochs` = epochs since improvement, shown as `n / patience` to mirror EarlyStopping).
-4. **Infer / Active Learning**: Checkpoint + **the video itself** → `inference_service.run_inference_video` decodes + crops frames on the fly (same `FindRatBoundingBox` + background as training) → per-frame predictions + normalized entropy, indexed by native frame number. No pre-extracted frame dir. Uncertainty heatmap (green→red) + misclassification ticks on the timeline; jump to next uncertain segment / misclassified frame for relabeling.
+HDF5 project bundles, version **5**. Two flavors: lightweight (manifest +
+labels) and package (`package=True`, adds pose files, features, predictions and
+models). Packages are far smaller than the TSM predecessor's, which embedded a
+PNG per labeled frame.
 
-**Frame-index invariant:** native video frame number is the single canonical index across labels (`time` column), extracted frame filenames, and inference output. There is no framerate downsampling.
+```
+/                                (attrs: rlt_version=5, packaged)
+/                                (attr: manifest — JSON string)
+/labels/{video_id}               (UTF-8 CSV)
+/pose/{video_id}                 (uint8 file bytes, gzip)   [package]
+/features/{iteration}/{video_id} (uint8 .npz bytes, gzip)   [package]
+/predictions/{video_id}          (UTF-8 JSON)               [package]
+/models/checkpoints/{name}       (uint8 .joblib blob)       [package]
+```
+
+On import, **pose paths are rewritten** to the extracted copies (so a package is
+immediately trainable), while video paths are left for the user to re-link.
+Version < 5 files are rejected — they carry cropped frames but no pose data.
 
 ## CSV Formats
 
-**Import auto-detects two formats:**
+Import auto-detects two formats. Bout CSV (`start,end,behavior` with MM:SS.mmm
+timestamps) and the frame-level one-hot matrix (`time` + one column per
+behavior, native frame index). Predictions export in the latter format, so a
+batch result re-imports as labels for review.
 
-Bout CSV (header contains `start`, `end`, `behav*`):
-```csv
-start,end,behavior
-00:01.000,00:05.500,grooming
-```
-
-Frame-level label matrix (header contains `time` or numeric first column):
-```csv
-time,grooming,walking,rearing
-0,1,0,0
-1,1,0,0
-2,0,1,0
-```
-
-**Export** produces bout CSV (start/end as MM:SS.mmm) or one-hot frame-level CSV.
-
-## Import Project
-
-"Import Project" button loads a video + label CSV from another project into the labeling UI. Two file dialogs (video then CSV), loads video, parses labels via `parseCsvAndImport()`. New behaviors are auto-created if they don't exist in the current session.
-
-## Data Storage
-
-- **Labels/bouts**: `localStorage["bouts"]` and `localStorage["behaviors"]` in Electron renderer
-- **Preprocessed frames**: Flat numbered PNGs (e.g., `frames_out/video_name/0.png`)
-- **Checkpoints**: `lightning_logs/version_N/checkpoints/*.ckpt`
-- **Backgrounds**: `backgrounds/bg_videoname.png`
-- **Training metrics**: JSON-lines files tailed by SSE endpoints
-
-## TorchScript Export
-
-```python
-from convert_torchscript_tsm import export_model
-export_model(
-    checkpoint_path="lightning_logs/.../epoch=22.ckpt",
-    output_name="tsm_realtime",
-    output_dir="bonsai_models",
-    tsm_stages=[1, 2, 3, 4, 5, 6, 7],
-)
-```
-
-Output `.pt` file is compatible with Bonsai.ML.Torch `LoadScriptModule` for real-time rig deployment.
-
-## Build / Distribution
+## Running Tests
 
 ```bash
-cd LabelingApp
-npm run dist:win    # Windows (NSIS + portable)
-npm run dist:mac    # macOS (DMG)
-npm run dist:linux  # Linux (AppImage + deb)
+pixi run test                              # all 132
+pixi run pytest tests/test_asoid_core.py   # single module
 ```
+
+Tests use synthetic pose data (two behaviors that differ in how far the body
+parts spread from the centroid) — a genuinely learnable task, so the
+active-learning tests assert on real F1 movement rather than mocks.
 
 ## Dependencies
 
-(`pixi.toml` is the authoritative list — conda-forge env with a `pixi.lock`; `backend/requirements.txt` is a pip fallback.)
+`pixi.toml` is authoritative (`backend/requirements.txt` is a pip fallback).
 
-- **Python** (via pixi/conda-forge): FastAPI, Uvicorn, PyTorch (`pytorch-gpu` CUDA build, swap to `pytorch-cpu` on CPU machines), torchvision, Lightning, torchmetrics, timm, OpenCV, Albumentations, OmegaConf, numpy, pandas, h5py (`.rlt` files), wandb (optional training logging), matplotlib, pyyaml, scipy, optuna, **ffmpeg** (re-encode / labeled-video, now provided by the env)
+- **Python**: FastAPI, Uvicorn, scikit-learn (<1.3, matching upstream A-SOID so
+  models load in both apps), numba, joblib, numpy, pandas, scipy, h5py, OpenCV,
+  ffmpeg, matplotlib
 - **Node**: Electron 31, electron-builder, mp4box, xlsx
 - **Test**: pytest, pytest-asyncio, httpx

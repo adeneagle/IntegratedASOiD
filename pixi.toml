@@ -1,20 +1,21 @@
 # pixi project definition — the reproducible Python environment for the backend.
 #
-# This is the source of truth for the Python side (replacing manual conda envs +
-# RTASOID_PYTHON). It pulls CUDA-enabled PyTorch, ffmpeg, and the native
-# scientific stack from conda-forge into a project-local env at a deterministic
-# path (.pixi/envs/default), which the Electron app auto-discovers.
+# This is the source of truth for the Python side. It pulls ffmpeg and the
+# native scientific stack from conda-forge into a project-local env at a
+# deterministic path (.pixi/envs/default), which the Electron app auto-discovers.
 #
 #   pixi install        # materialize/pin the env (writes pixi.lock) + downloads
 #   pixi run backend    # run the FastAPI backend standalone
 #   pixi run test       # run the pytest suite
 #
-# CPU-only machine? Swap `pytorch-gpu` for `pytorch-cpu` below.
+# The classifier is a scikit-learn RandomForest over pose-derived features, so
+# there is no GPU dependency and no CUDA build to choose — this env installs and
+# runs identically on any machine.
 
 [project]
-name = "realtimeasoid"
+name = "asoid-desktop"
 version = "0.1.0"
-description = "Real-time clip-based animal behavior classifier (Electron GUI + FastAPI/PyTorch backend)."
+description = "Pose-based animal behavior classifier with active learning (Electron GUI + FastAPI/scikit-learn backend)."
 channels = ["conda-forge"]
 platforms = ["win-64"]   # add "linux-64" / "osx-64" here, then re-run `pixi install`
 
@@ -24,29 +25,23 @@ test = "pytest"
 
 [dependencies]
 python = "3.12.*"
-# Deep learning (CUDA build pulled from conda-forge — bundles the CUDA runtime,
-# no separate CUDA toolkit install needed).
-pytorch-gpu = "*"
-torchvision = "*"
-lightning = "*"
-torchmetrics = "*"
-timm = "*"
-# Vision / video / numerics
-opencv = "*"
-albumentations = "*"
-ffmpeg = "*"
+# Classifier + feature extraction. scikit-learn is pinned below 1.3 to match
+# upstream A-SOID, so RandomForest models pickled by either app load in both.
+scikit-learn = "<1.3"
+numba = ">=0.52"
+joblib = "*"
 numpy = "*"
 pandas = "*"
 scipy = "*"
-h5py = "*"
+h5py = "*"          # SLEAP .h5 pose files + .rlt project bundles
+# Video / IO (labeling playback is Electron-side; these are for labeled-video export)
+opencv = "*"
+ffmpeg = "*"
 matplotlib = "*"
-# Backend / config / tuning / logging
+# Backend
 fastapi = "*"
 uvicorn = "*"
-omegaconf = "*"
 pyyaml = "*"
-optuna = "*"
-wandb = "*"
 # Tests
 pytest = "*"
 pytest-asyncio = "*"

@@ -1,4 +1,10 @@
-"""Inference router: run per-frame inference, stream progress, return results."""
+"""Inference router: run per-frame inference, stream progress, return results.
+
+Endpoint paths, the SSE status stream and the results payload are unchanged from
+the TSM version — the renderer's Active Learning panel consumes them as-is.
+Only the run request changed: a pose file replaces video + background + crop
+params.
+"""
 
 import asyncio
 import json
@@ -10,6 +16,7 @@ from pydantic import BaseModel
 
 from backend.services.inference_service import (
     start_inference,
+    start_batch_inference,
     get_task,
 )
 
@@ -20,17 +27,27 @@ router = APIRouter()
 
 class InferenceRequest(BaseModel):
     checkpoint_path: str
-    # Either a pre-extracted frame_dir, OR a video for on-the-fly inference.
-    frame_dir: Optional[str] = None
-    video_path: Optional[str] = None
-    bg_path: Optional[str] = None
-    crop_params: Optional[dict] = None
-    frames_per_group: int = 3
-    image_size: int = 224
-    extra_model_config: Optional[dict] = None
-    # Optional scoping (video path only): inclusive [start, end] native-index
-    # pairs. Omit/None to run on the entire video.
+    pose_path: str
+    origin: str = "deeplabcut"
+    # Defaults to the selection recorded on the checkpoint when omitted.
+    bodyparts: Optional[list[str]] = None
+    llh_value: float = 0.6
+    animals: Optional[list[str]] = None
+    multi_animal: bool = False
+    # Optional scoping: inclusive [start, end] native-index pairs.
+    # Omit/None to run on the entire recording.
     frame_ranges: Optional[list] = None
+
+
+class BatchInferenceRequest(BaseModel):
+    checkpoint_path: str
+    pose_paths: list[str]
+    output_dir: str
+    origin: str = "deeplabcut"
+    bodyparts: Optional[list[str]] = None
+    llh_value: float = 0.6
+    animals: Optional[list[str]] = None
+    multi_animal: bool = False
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -38,19 +55,37 @@ class InferenceRequest(BaseModel):
 @router.post("/run")
 async def api_run_inference(req: InferenceRequest):
     """Start inference in background. Returns task_id."""
-    if not req.video_path and not req.frame_dir:
-        raise HTTPException(status_code=422, detail="Provide either video_path or frame_dir")
     try:
         task_id = start_inference(
             checkpoint_path=req.checkpoint_path,
-            frame_dir=req.frame_dir,
-            frames_per_group=req.frames_per_group,
-            image_size=req.image_size,
-            model_config=req.extra_model_config,
-            video_path=req.video_path,
-            bg_path=req.bg_path,
-            crop_params=req.crop_params,
+            pose_path=req.pose_path,
+            origin=req.origin,
+            bodyparts=req.bodyparts,
+            llh_value=req.llh_value,
+            animals=req.animals,
+            multi_animal=req.multi_animal,
             frame_ranges=req.frame_ranges,
+        )
+        return {"task_id": task_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/batch")
+async def api_run_batch_inference(req: BatchInferenceRequest):
+    """Apply a model to several unlabeled pose files. Returns task_id."""
+    if not req.pose_paths:
+        raise HTTPException(status_code=422, detail="No pose files selected.")
+    try:
+        task_id = start_batch_inference(
+            checkpoint_path=req.checkpoint_path,
+            pose_paths=req.pose_paths,
+            output_dir=req.output_dir,
+            origin=req.origin,
+            bodyparts=req.bodyparts,
+            llh_value=req.llh_value,
+            animals=req.animals,
+            multi_animal=req.multi_animal,
         )
         return {"task_id": task_id}
     except Exception as e:

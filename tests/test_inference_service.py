@@ -1,315 +1,223 @@
-"""Tests for backend.services.inference_service."""
+"""Tests for the inference service.
 
-import math
+The response-shape tests matter most: the renderer's Active Learning panel was
+carried over from the TSM app untouched, so it consumes exactly
+`{frames: [{index, predicted_class, uncertainty}], class_names}`. Any drift here
+silently breaks the uncertainty heatmap.
+"""
+
 import os
 
-import cv2
+import joblib
 import numpy as np
 import pytest
-import torch
 
-from backend.services.inference_service import (
-    _build_val_transform,
-    _load_frame,
-    get_task,
-    start_inference,
-)
+from backend.services import inference_service, pose_service, training_service
+from tests.conftest import BODYPARTS, FPS, wait_for
 
 
-# ── _build_val_transform ─────────────────────────────────────────────────
+@pytest.fixture
+def trained_project(tmp_path, dlc_csv, label_csv):
+    """A project with features extracted and a model trained. Returns (dir, ckpt)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    task_id = pose_service.start_extraction(
+        project_dir=str(project),
+        videos=[{"id": "vid1", "pose_path": dlc_csv, "label_path": label_csv}],
+        origin="deeplabcut", bodyparts=BODYPARTS, framerate=FPS,
+    )
+    assert wait_for(lambda: pose_service.get_task(task_id)["status"]) == "completed"
 
-class TestBuildValTransform:
-    def test_returns_compose(self):
-        t = _build_val_transform(224)
-        assert t is not None
-
-    def test_resizes_image(self):
-        t = _build_val_transform(128)
-        img = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
-        result = t(image=img)
-        assert result["image"].shape == (3, 128, 128)
-
-    def test_additional_targets(self):
-        t = _build_val_transform(64)
-        img1 = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-        img2 = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-        result = t(image=img1, image1=img2)
-        assert result["image"].shape == (3, 64, 64)
-        assert result["image1"].shape == (3, 64, 64)
-
-    def test_normalizes_to_float(self):
-        t = _build_val_transform(32)
-        img = np.full((32, 32, 3), 128, dtype=np.uint8)
-        result = t(image=img)
-        # After normalization, values should be floats near 0 (not 0-255)
-        assert result["image"].dtype == torch.float32
-        assert result["image"].abs().max() < 10  # normalized values
+    train_id = training_service.start_training({
+        "project_dir": str(project),
+        "video_ids": ["vid1"],
+        "init_ratio": 0.1,
+        "max_iter": 3,
+        "max_samples_iter": 20,
+        "conf_threshold": 0.6,
+        "checkpoint_dir": os.path.join(str(project), "models", "checkpoints"),
+        "model_name": "m",
+    })
+    status = wait_for(lambda: training_service.get_task(train_id)["status"])
+    assert status == "completed", training_service.get_task(train_id).get("error")
+    return str(project), training_service.get_task(train_id)["checkpoint_path"]
 
 
-# ── _load_frame ──────────────────────────────────────────────────────────
-
-class TestLoadFrame:
-    def test_loads_rgb(self, tmp_path):
-        img = np.zeros((10, 10, 3), dtype=np.uint8)
-        img[:, :, 2] = 255  # Red in BGR
-        path = str(tmp_path / "red.png")
-        cv2.imwrite(path, img)
-
-        result = _load_frame(path)
-        # Should be RGB, so red channel (index 0) should be 255
-        assert result[:, :, 0].mean() == 255
-        assert result[:, :, 2].mean() == 0
-
-    def test_nonexistent_raises(self):
-        with pytest.raises(FileNotFoundError, match="Cannot read frame"):
-            _load_frame("/nonexistent/frame.png")
+def _infer(ckpt, pose_path, **kwargs):
+    task_id = inference_service.start_inference(
+        checkpoint_path=ckpt, pose_path=pose_path, origin="deeplabcut", **kwargs
+    )
+    status = wait_for(lambda: inference_service.get_task(task_id)["status"])
+    return inference_service.get_task(task_id), status
 
 
-# ── run_inference (integration) ──────────────────────────────────────────
-# These tests require a model checkpoint. We mock TSMClassifier.load_from_checkpoint
-# to avoid needing actual trained weights.
+def test_results_match_the_renderer_contract(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, status = _infer(ckpt, dlc_csv)
+    assert status == "completed", task.get("error")
 
-class TestRunInference:
-    @pytest.fixture
-    def mock_model(self, monkeypatch):
-        """Patch TSMClassifier.load_from_checkpoint to return a fake model."""
-        class FakeModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.num_classes = 3
-                self.class_names = ["walk", "groom", "rear"]
-                self.linear = torch.nn.Linear(1, 3)  # dummy param
+    results = task["results"]
+    assert set(results) >= {"frames", "class_names"}
+    assert isinstance(results["class_names"], list)
 
-            def forward(self, x):
-                B = x.shape[0]
-                # Return fixed logits
-                return torch.tensor([[1.0, 0.5, 0.2]] * B)
-
-            def eval(self):
-                return self
-
-            def to(self, device):
-                return self
-
-        fake = FakeModel()
-
-        def fake_load(*args, **kwargs):
-            return fake
-
-        # Patch at the module where it's imported
-        import model_tsm
-        monkeypatch.setattr(model_tsm.TSMClassifier, "load_from_checkpoint", staticmethod(fake_load))
-        return fake
-
-    def test_run_inference_returns_results(self, synthetic_frames, mock_model, tmp_path):
-        from backend.services.inference_service import run_inference
-
-        results = run_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-        )
-        assert "frames" in results
-        assert "class_names" in results
-        assert results["class_names"] == ["walk", "groom", "rear"]
-        # With 20 frames and T=3, we get results for frames 2..19 = 18 results
-        assert len(results["frames"]) == 18
-
-    def test_uncertainty_is_normalized(self, synthetic_frames, mock_model):
-        from backend.services.inference_service import run_inference
-
-        results = run_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-        )
-        for frame_result in results["frames"]:
-            assert 0.0 <= frame_result["uncertainty"] <= 1.0
-
-    def test_predictions_sum_to_one(self, synthetic_frames, mock_model):
-        from backend.services.inference_service import run_inference
-
-        results = run_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-        )
-        for frame_result in results["frames"]:
-            total = sum(frame_result["predictions"])
-            assert abs(total - 1.0) < 1e-4
-
-    def test_cancel_stops_early(self, synthetic_frames, mock_model):
-        from backend.services.inference_service import run_inference
-
-        counter = {"n": 0}
-
-        def on_progress(done, total):
-            counter["n"] = done
-
-        results = run_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-            on_progress=on_progress,
-            cancel_flag=lambda: counter["n"] >= 5,
-        )
-        assert len(results["frames"]) < 18
-
-    def test_progress_callback(self, synthetic_frames, mock_model):
-        from backend.services.inference_service import run_inference
-
-        progress_log = []
-
-        def on_progress(done, total):
-            progress_log.append((done, total))
-
-        run_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-            on_progress=on_progress,
-        )
-        assert len(progress_log) == 18
-        assert progress_log[-1] == (18, 18)
+    frames = results["frames"]
+    assert len(frames) == 3000, "one entry per native video frame"
+    assert set(frames[0]) >= {"index", "predicted_class", "uncertainty"}
+    assert isinstance(frames[0]["index"], int)
+    assert isinstance(frames[0]["predicted_class"], int)
+    assert isinstance(frames[0]["uncertainty"], float)
 
 
-# ── run_inference_video (on-the-fly Active Learning) ─────────────────────
-
-class TestRunInferenceVideo:
-    @pytest.fixture
-    def mock_model(self, monkeypatch):
-        class FakeModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.num_classes = 3
-                self.class_names = ["walk", "groom", "rear"]
-                self.linear = torch.nn.Linear(1, 3)
-
-            def forward(self, x):
-                return torch.tensor([[1.0, 0.5, 0.2]] * x.shape[0])
-
-            def eval(self):
-                return self
-
-            def to(self, device):
-                return self
-
-        fake = FakeModel()
-        import model_tsm
-        monkeypatch.setattr(model_tsm.TSMClassifier, "load_from_checkpoint", staticmethod(lambda *a, **k: fake))
-        return fake
-
-    def test_results_indexed_by_native_frame(self, synthetic_video, synthetic_background, mock_model):
-        from backend.services.inference_service import run_inference_video
-
-        video_path, num_frames = synthetic_video
-        results = run_inference_video(
-            checkpoint_path="fake.ckpt",
-            video_path=video_path,
-            bg_path=synthetic_background,
-            crop_params={"box_size": 32, "difference_threshold": 5},
-            frames_per_group=3,
-            image_size=64,
-        )
-        assert results["class_names"] == ["walk", "groom", "rear"]
-        # T=3 over num_frames → results for native indices 2..num_frames-1.
-        indices = [f["index"] for f in results["frames"]]
-        assert indices == list(range(2, num_frames))
-        for f in results["frames"]:
-            assert 0.0 <= f["uncertainty"] <= 1.0
-            assert abs(sum(f["predictions"]) - 1.0) < 1e-4
-
-    def test_frame_ranges_scopes_to_segment(self, synthetic_video, synthetic_background, mock_model):
-        from backend.services.inference_service import run_inference_video
-
-        video_path, num_frames = synthetic_video
-        # A mid-video segment well inside the clip-able range.
-        seg_start, seg_end = 5, 9
-        results = run_inference_video(
-            checkpoint_path="fake.ckpt",
-            video_path=video_path,
-            bg_path=synthetic_background,
-            crop_params={"box_size": 32, "difference_threshold": 5},
-            frames_per_group=3,
-            image_size=64,
-            frame_ranges=[[seg_start, seg_end]],
-        )
-        indices = [f["index"] for f in results["frames"]]
-        # Predictions only for the requested segment — and native indices preserved.
-        assert indices == list(range(seg_start, seg_end + 1))
-
-    def test_frame_ranges_multiple_disjoint(self, synthetic_video, synthetic_background, mock_model):
-        from backend.services.inference_service import run_inference_video
-
-        video_path, num_frames = synthetic_video
-        results = run_inference_video(
-            checkpoint_path="fake.ckpt",
-            video_path=video_path,
-            bg_path=synthetic_background,
-            crop_params={"box_size": 32, "difference_threshold": 5},
-            frames_per_group=3,
-            image_size=64,
-            frame_ranges=[[3, 4], [8, 10]],
-        )
-        indices = [f["index"] for f in results["frames"]]
-        assert indices == [3, 4, 8, 9, 10]
-
-    def test_frame_ranges_drops_uncliplable_early_frames(self, synthetic_video, synthetic_background, mock_model):
-        from backend.services.inference_service import run_inference_video
-
-        video_path, num_frames = synthetic_video
-        # Frames 0,1 can't form a T=3 clip; only frame 2 is emittable.
-        results = run_inference_video(
-            checkpoint_path="fake.ckpt",
-            video_path=video_path,
-            bg_path=synthetic_background,
-            crop_params={"box_size": 32, "difference_threshold": 5},
-            frames_per_group=3,
-            image_size=64,
-            frame_ranges=[[0, 2]],
-        )
-        indices = [f["index"] for f in results["frames"]]
-        assert indices == [2]
+def test_frames_are_native_indexed_and_contiguous(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, _ = _infer(ckpt, dlc_csv)
+    indices = [f["index"] for f in task["results"]["frames"]]
+    assert indices == list(range(3000))
 
 
-# ── start_inference (async task) ─────────────────────────────────────────
+def test_uncertainty_is_normalized(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, _ = _infer(ckpt, dlc_csv)
+    unc = np.array([f["uncertainty"] for f in task["results"]["frames"]])
+    assert unc.min() >= 0.0
+    assert unc.max() <= 1.0
 
-class TestStartInference:
-    def test_returns_task_id(self, synthetic_frames, monkeypatch):
-        # Patch the model loading to avoid checkpoint file
-        import model_tsm
 
-        class FakeModel(torch.nn.Module):
-            num_classes = 2
-            class_names = ["a", "b"]
+def test_predicted_classes_index_into_class_names(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, _ = _infer(ckpt, dlc_csv)
+    results = task["results"]
+    n = len(results["class_names"])
+    for f in results["frames"]:
+        assert 0 <= f["predicted_class"] < n
 
-            def forward(self, x):
-                return torch.tensor([[0.5, 0.5]] * x.shape[0])
 
-            def eval(self):
-                return self
+def test_predictions_recover_the_ground_truth(trained_project, dlc_csv, behavior_series):
+    """A sanity check that the whole pipeline actually learned something."""
+    _project, ckpt = trained_project
+    task, _ = _infer(ckpt, dlc_csv)
+    results = task["results"]
+    pred = np.array([f["predicted_class"] for f in results["frames"]])
+    rearing = results["class_names"].index("rearing")
+    truth_mask = behavior_series == 1
+    accuracy = (pred[truth_mask] == rearing).mean()
+    assert accuracy > 0.8, f"accuracy on labeled frames was only {accuracy:.2f}"
 
-            def to(self, device):
-                return self
 
-        monkeypatch.setattr(
-            model_tsm.TSMClassifier,
-            "load_from_checkpoint",
-            staticmethod(lambda *a, **kw: FakeModel()),
-        )
+def test_frame_ranges_scope_the_output(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, status = _infer(ckpt, dlc_csv, frame_ranges=[[100, 199], [500, 549]])
+    assert status == "completed", task.get("error")
+    frames = task["results"]["frames"]
+    assert len(frames) == 150
+    assert frames[0]["index"] == 100
+    assert frames[99]["index"] == 199
+    assert frames[100]["index"] == 500
 
-        task_id = start_inference(
-            checkpoint_path="fake.ckpt",
-            frame_dir=synthetic_frames,
-            frames_per_group=3,
-            image_size=64,
-        )
-        assert isinstance(task_id, str)
-        task = get_task(task_id)
-        assert task is not None
-        assert task["status"] in ("running", "completed")
+
+def test_frame_ranges_normalize_reversed_pairs(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, _ = _infer(ckpt, dlc_csv, frame_ranges=[[199, 100]])
+    assert len(task["results"]["frames"]) == 100
+
+
+def test_bodypart_mismatch_is_rejected(trained_project, dlc_csv):
+    """The upstream 1710d15 failure: a different selection must not silently run."""
+    _project, ckpt = trained_project
+    task, status = _infer(ckpt, dlc_csv, bodyparts=["nose", "tailbase"])
+    assert status == "error"
+    assert "body-part selection" in task["error"]
+
+
+def test_bodyparts_default_to_the_checkpoint(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task, status = _infer(ckpt, dlc_csv, bodyparts=None)
+    assert status == "completed", task.get("error")
+
+
+def test_missing_checkpoint_raises():
+    with pytest.raises(FileNotFoundError):
+        inference_service.load_model("/no/such/model.joblib")
+
+
+def test_non_checkpoint_file_rejected(tmp_path):
+    bad = tmp_path / "notamodel.joblib"
+    joblib.dump([1, 2, 3], bad)
+    with pytest.raises(ValueError, match="not an A-SOID Desktop checkpoint"):
+        inference_service.load_model(str(bad))
+
+
+def test_wanted_set_none_means_whole_video():
+    assert inference_service._wanted_set(None) is None
+    assert inference_service._wanted_set([]) is None
+
+
+def test_wanted_set_is_inclusive():
+    assert inference_service._wanted_set([[2, 4]]) == {2, 3, 4}
+
+
+def test_cancel_stops_inference(trained_project, dlc_csv):
+    _project, ckpt = trained_project
+    task_id = inference_service.start_inference(
+        checkpoint_path=ckpt, pose_path=dlc_csv, origin="deeplabcut"
+    )
+    inference_service.get_task(task_id)["cancel"] = True
+    status = wait_for(lambda: inference_service.get_task(task_id)["status"])
+    assert status in ("cancelled", "completed")  # may finish before the flag is read
+
+
+# ── Batch prediction ──────────────────────────────────────────────────────
+
+def test_batch_writes_importable_one_hot_csv(trained_project, dlc_csv, tmp_path):
+    _project, ckpt = trained_project
+    outdir = tmp_path / "batch_out"
+    task_id = inference_service.start_batch_inference(
+        checkpoint_path=ckpt, pose_paths=[dlc_csv],
+        output_dir=str(outdir), origin="deeplabcut",
+    )
+    status = wait_for(lambda: inference_service.get_task(task_id)["status"])
+    task = inference_service.get_task(task_id)
+    assert status == "completed", task.get("error")
+
+    files = task["results"]["files"]
+    assert len(files) == 1
+    out_csv = files[0]["output_path"]
+    assert os.path.exists(out_csv)
+
+    with open(out_csv, encoding="utf-8") as f:
+        header = f.readline().strip()
+        first = f.readline().strip()
+    # Must be the same layout the labeling UI imports.
+    assert header.startswith("time,")
+    assert header.split(",")[1:] == list(files[0]["summary"].keys())
+    assert first.split(",")[0] == "0"
+    # Exactly one class flagged per row.
+    assert sum(int(v) for v in first.split(",")[1:]) == 1
+
+
+def test_batch_csv_round_trips_through_the_label_parser(trained_project, dlc_csv, tmp_path):
+    _project, ckpt = trained_project
+    outdir = tmp_path / "batch_out"
+    task_id = inference_service.start_batch_inference(
+        checkpoint_path=ckpt, pose_paths=[dlc_csv],
+        output_dir=str(outdir), origin="deeplabcut",
+    )
+    wait_for(lambda: inference_service.get_task(task_id)["status"])
+    out_csv = inference_service.get_task(task_id)["results"]["files"][0]["output_path"]
+
+    names, frame_to_col = pose_service.read_label_csv(out_csv)
+    assert names, "predictions must parse as labels"
+    assert len(frame_to_col) == 3000
+
+
+def test_batch_summary_reports_per_class_counts(trained_project, dlc_csv, tmp_path):
+    _project, ckpt = trained_project
+    task_id = inference_service.start_batch_inference(
+        checkpoint_path=ckpt, pose_paths=[dlc_csv],
+        output_dir=str(tmp_path / "out"), origin="deeplabcut",
+    )
+    wait_for(lambda: inference_service.get_task(task_id)["status"])
+    summary = inference_service.get_task(task_id)["results"]["files"][0]["summary"]
+    assert sum(s["frames"] for s in summary.values()) == 3000
+    for s in summary.values():
+        assert 0.0 <= s["mean_uncertainty"] <= 1.0

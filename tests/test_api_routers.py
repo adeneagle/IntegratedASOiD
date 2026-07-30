@@ -1,473 +1,233 @@
-"""
-Integration tests for FastAPI routers using httpx AsyncClient.
+"""Endpoint-level tests: schemas, validation, and the task/SSE lifecycle."""
 
-Tests the HTTP layer: request validation, response shapes, SSE streaming,
-and error handling. Heavy operations (video I/O, model loading) are mocked.
-"""
-
-import asyncio
-import json
 import os
-import time
 
 import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
 
-from backend.server import app
-
-
-@pytest_asyncio.fixture
-async def ac():
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+from backend.services import inference_service, pose_service, training_service
+from tests.conftest import BODYPARTS, FPS, wait_for
 
 
-# ── Health endpoint ──────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_health(ac):
-    resp = await ac.get("/api/health")
+async def test_health_reports_the_numeric_stack(client):
+    async with client as ac:
+        resp = await ac.get("/api/health")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    # Health also reports the interpreter + GPU the backend will train on.
-    assert "device" in body
-    assert "cuda_available" in body["device"]
-    assert "python" in body["device"]
+    runtime = body["runtime"]
+    assert "numpy" in runtime
+    assert "sklearn" in runtime
+    assert "numba" in runtime
 
 
-# ── Preprocessing router ────────────────────────────────────────────────
+async def test_health_does_not_mention_torch(client):
+    """The torch stack is gone; nothing should still be probing for it."""
+    async with client as ac:
+        resp = await ac.get("/api/health")
+    assert "torch" not in resp.text.lower()
+    assert "cuda" not in resp.text.lower()
 
-class TestPreprocessingRouter:
-    @pytest.mark.asyncio
-    async def test_background_missing_video(self, ac):
-        resp = await ac.post("/api/preprocess/background", json={
-            "video_path": "/nonexistent/video.mp4",
+
+# ── Pose router ───────────────────────────────────────────────────────────
+
+async def test_inspect_pose_endpoint(client, dlc_csv):
+    async with client as ac:
+        resp = await ac.post("/api/pose/inspect",
+                             json={"pose_path": dlc_csv, "origin": "deeplabcut"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["n_frames"] == 3000
+    assert sorted(body["bodyparts"]) == sorted(BODYPARTS)
+
+
+async def test_inspect_pose_missing_file_is_404(client):
+    async with client as ac:
+        resp = await ac.post("/api/pose/inspect",
+                             json={"pose_path": "/no/such.csv", "origin": "deeplabcut"})
+    assert resp.status_code == 404
+
+
+async def test_inspect_pose_bad_origin_is_400(client, dlc_csv):
+    async with client as ac:
+        resp = await ac.post("/api/pose/inspect",
+                             json={"pose_path": dlc_csv, "origin": "nonsense"})
+    assert resp.status_code == 400
+
+
+async def test_keypoints_endpoint(client, dlc_csv):
+    async with client as ac:
+        resp = await ac.post("/api/pose/keypoints", json={
+            "pose_path": dlc_csv, "origin": "deeplabcut",
+            "bodyparts": BODYPARTS, "start": 0, "end": 25,
         })
-        assert resp.status_code == 500
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["n_frames"] == 25
+    assert len(body["points"]) == len(BODYPARTS)
 
-    @pytest.mark.asyncio
-    async def test_background_success(self, ac, synthetic_video, tmp_path):
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/preprocess/background", json={
-            "video_path": video_path,
-            "num_frames": 5,
-            "output_dir": str(tmp_path / "bg"),
+
+async def test_extract_features_rejects_fewer_than_two_bodyparts(client, tmp_path, dlc_csv):
+    async with client as ac:
+        resp = await ac.post("/api/pose/extract-features", json={
+            "project_dir": str(tmp_path), "origin": "deeplabcut",
+            "videos": [{"id": "v", "pose_path": dlc_csv}],
+            "bodyparts": ["nose"], "framerate": FPS,
         })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "path" in data
-        assert os.path.exists(data["path"])
+    assert resp.status_code == 422
+    assert "at least two" in resp.json()["detail"]
 
-    @pytest.mark.asyncio
-    async def test_preview_success(self, ac, synthetic_video, synthetic_background):
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/preprocess/preview", json={
-            "video_path": video_path,
-            "bg_path": synthetic_background,
-            "frame_index": 5,
-            "crop_params": {"box_size": 32, "difference_threshold": 5},
+
+async def test_extract_features_rejects_empty_video_list(client, tmp_path):
+    async with client as ac:
+        resp = await ac.post("/api/pose/extract-features", json={
+            "project_dir": str(tmp_path), "origin": "deeplabcut",
+            "videos": [], "bodyparts": BODYPARTS, "framerate": FPS,
         })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "original_bbox" in data
-        assert "mask" in data
-        assert "cropped" in data
+    assert resp.status_code == 422
 
-    @pytest.mark.asyncio
-    async def test_preview_invalid_frame(self, ac, synthetic_video, synthetic_background):
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/preprocess/preview", json={
-            "video_path": video_path,
-            "bg_path": synthetic_background,
-            "frame_index": 99999,
-            "crop_params": {"box_size": 32, "difference_threshold": 5},
-        })
-        assert resp.status_code == 500
 
-    @pytest.mark.asyncio
-    async def test_run_returns_task_id(self, ac, synthetic_video, tmp_path):
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/preprocess/run", json={
-            "video_path": video_path,
-            "output_dir": str(tmp_path / "out"),
-            "crop_params": {"box_size": 32, "difference_threshold": 5},
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "task_id" in data
-
-    @pytest.mark.asyncio
-    async def test_status_not_found(self, ac):
-        resp = await ac.get("/api/preprocess/status/nonexistent-id")
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_stop_not_found(self, ac):
-        resp = await ac.post("/api/preprocess/stop/nonexistent-id")
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_run_request_validation(self, ac):
-        # Missing required fields
-        resp = await ac.post("/api/preprocess/run", json={})
-        assert resp.status_code == 422
-
-    @pytest.mark.asyncio
-    async def test_crop_params_defaults(self, ac, synthetic_video, tmp_path):
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/preprocess/run", json={
-            "video_path": video_path,
-            "output_dir": str(tmp_path / "defaults"),
+async def test_extract_features_lifecycle(client, tmp_path, dlc_csv, label_csv):
+    project = tmp_path / "proj"
+    project.mkdir()
+    async with client as ac:
+        resp = await ac.post("/api/pose/extract-features", json={
+            "project_dir": str(project), "origin": "deeplabcut",
+            "videos": [{"id": "v1", "pose_path": dlc_csv, "label_path": label_csv}],
+            "bodyparts": BODYPARTS, "framerate": FPS,
         })
         assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+        wait_for(lambda: pose_service.get_task(task_id)["status"])
+
+        results = await ac.get(f"/api/pose/results/{task_id}")
+        assert results.status_code == 200
+        body = results.json()
+        assert body["class_names"][-1] == "other"
+        assert body["bin_width"] == 3
+        assert body["videos"][0]["n_features"] == 16
 
 
-# ── Training router ──────────────────────────────────────────────────────
+async def test_pose_results_before_completion_is_400(client, tmp_path, dlc_csv):
+    project = tmp_path / "proj"
+    project.mkdir()
+    async with client as ac:
+        resp = await ac.post("/api/pose/extract-features", json={
+            "project_dir": str(project), "origin": "deeplabcut",
+            "videos": [{"id": "v1", "pose_path": dlc_csv}],
+            "bodyparts": BODYPARTS, "framerate": FPS,
+        })
+        task_id = resp.json()["task_id"]
+        # The task errors (no labels); results must still refuse to serve.
+        wait_for(lambda: pose_service.get_task(task_id)["status"])
+        results = await ac.get(f"/api/pose/results/{task_id}")
+    assert results.status_code == 400
 
-class TestTrainingRouter:
-    @pytest.mark.asyncio
-    async def test_start_returns_task_id(self, ac, tmp_path):
+
+async def test_pose_status_unknown_task_is_404(client):
+    async with client as ac:
+        resp = await ac.get("/api/pose/status/nope")
+    assert resp.status_code == 404
+
+
+# ── Training router ───────────────────────────────────────────────────────
+
+async def test_training_rejects_empty_video_list(client, tmp_path):
+    async with client as ac:
         resp = await ac.post("/api/training/start", json={
-            "label_paths": ["/fake/labels.csv"],
-            "frame_dirs": ["/fake/frames"],
-            "max_epochs": 1,
-            "checkpoint_dir": str(tmp_path / "ckpts"),
+            "project_dir": str(tmp_path), "video_ids": [],
         })
-        assert resp.status_code == 200
-        assert "task_id" in resp.json()
+    assert resp.status_code == 422
 
-    @pytest.mark.asyncio
-    async def test_start_validation(self, ac):
-        # Missing required label_paths and frame_dirs
+
+async def test_training_start_returns_a_task_id(client, tmp_path):
+    async with client as ac:
         resp = await ac.post("/api/training/start", json={
-            "max_epochs": 1,
+            "project_dir": str(tmp_path), "video_ids": ["nope"],
         })
-        assert resp.status_code == 422
+    assert resp.status_code == 200
+    assert "task_id" in resp.json()
 
-    @pytest.mark.asyncio
-    async def test_status_not_found(self, ac):
-        resp = await ac.get("/api/training/status/nonexistent-id")
-        assert resp.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_stop_not_found(self, ac):
-        resp = await ac.post("/api/training/stop/nonexistent-id")
-        assert resp.status_code == 404
+async def test_training_stop_unknown_task_is_404(client):
+    async with client as ac:
+        resp = await ac.post("/api/training/stop/nope")
+    assert resp.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_checkpoints_empty(self, ac, tmp_path):
-        resp = await ac.get("/api/training/checkpoints", params={
-            "search_dirs": str(tmp_path),
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["checkpoints"] == []
 
-    @pytest.mark.asyncio
-    async def test_checkpoints_finds_files(self, ac, tmp_path):
-        (tmp_path / "model.ckpt").write_bytes(b"x" * 100)
-        resp = await ac.get("/api/training/checkpoints", params={
-            "search_dirs": str(tmp_path),
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data["checkpoints"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_check_coverage(self, ac, tmp_path):
-        import csv
-        labels = tmp_path / "vid.csv"
-        with open(labels, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["time", "a", "b"])
-            for fn in (2, 3, 4):
-                w.writerow([fn, 1, 0])
-        frames = tmp_path / "vid"
-        frames.mkdir()
-        for i in (2, 3, 4):  # missing context 0,1
-            (frames / f"{i}.png").write_bytes(b"")
-
-        resp = await ac.post("/api/training/check-coverage", json={
-            "frame_dirs": [str(frames)],
-            "label_paths": [str(labels)],
-            "frames_per_group": 3,
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total_labeled"] == 3
-        assert data["total_ready"] == 1  # only frame 4 has its full triplet
-        assert data["datasets"][0]["not_extracted"] == 2
-
-    @pytest.mark.asyncio
-    async def test_benchmark_inference(self, ac):
-        """Pre-training latency benchmark returns positive timings for the arch."""
-        resp = await ac.post("/api/training/benchmark-inference", json={
-            "variant": "b0",
-            "num_frames": 3,
-            "tsm_stages": [5, 6, 7],
-            "iters": 2,
-            "warmup": 1,  # keep the test fast (CPU on CI)
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ms_per_clip"] > 0
-        assert data["clips_per_sec"] > 0
-        assert data["variant"] == "b0"
-        assert data["num_frames"] == 3
-        assert data["precision"] == "fp32"
-
-    @pytest.mark.asyncio
-    async def test_benchmark_inference_fp16_on_cpu_downgrades(self, ac):
-        """FP16 without CUDA must not error — it downgrades to FP32 with a note."""
-        import torch
-        if torch.cuda.is_available():
-            pytest.skip("CUDA present; downgrade path not exercised")
-        resp = await ac.post("/api/training/benchmark-inference", json={
-            "variant": "b0", "iters": 2, "warmup": 1, "precision": "fp16",
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["precision"] == "fp32"
-        assert "note" in data
-
-    @pytest.mark.asyncio
-    async def test_config_defaults(self, ac, tmp_path):
-        """All optional fields should have defaults."""
-        resp = await ac.post("/api/training/start", json={
-            "label_paths": ["/fake/labels.csv"],
-            "frame_dirs": ["/fake/frames"],
-        })
-        assert resp.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_wandb_fields_accepted(self, ac, tmp_path):
-        """W&B logging fields are optional and accepted when provided."""
-        resp = await ac.post("/api/training/start", json={
-            "label_paths": ["/fake/labels.csv"],
-            "frame_dirs": ["/fake/frames"],
-            "max_epochs": 1,
-            "checkpoint_dir": str(tmp_path / "ckpts"),
-            "use_wandb": True,
-            "project_name": "my-project",
-            "run_name": "run-001",
-            "wandb_api_key": "secret-key",
-        })
-        assert resp.status_code == 200
-        assert "task_id" in resp.json()
+async def test_checkpoints_endpoint_returns_a_list(client, tmp_path):
+    async with client as ac:
+        resp = await ac.get("/api/training/checkpoints",
+                            params={"search_dirs": str(tmp_path)})
+    assert resp.status_code == 200
+    assert resp.json()["checkpoints"] == []
 
 
 # ── Inference router ──────────────────────────────────────────────────────
 
-class TestInferenceRouter:
-    @pytest.mark.asyncio
-    async def test_run_returns_task_id(self, ac, synthetic_frames, monkeypatch):
-        import model_tsm
-        import torch
-
-        class FakeModel(torch.nn.Module):
-            num_classes = 2
-            class_names = ["a", "b"]
-            def forward(self, x):
-                return torch.tensor([[0.5, 0.5]] * x.shape[0])
-            def eval(self):
-                return self
-            def to(self, device):
-                return self
-
-        monkeypatch.setattr(
-            model_tsm.TSMClassifier,
-            "load_from_checkpoint",
-            staticmethod(lambda *a, **kw: FakeModel()),
-        )
-
-        resp = await ac.post("/api/inference/run", json={
-            "checkpoint_path": "fake.ckpt",
-            "frame_dir": synthetic_frames,
+async def test_inference_batch_rejects_empty_file_list(client, tmp_path):
+    async with client as ac:
+        resp = await ac.post("/api/inference/batch", json={
+            "checkpoint_path": "x.joblib", "pose_paths": [],
+            "output_dir": str(tmp_path),
         })
-        assert resp.status_code == 200
-        assert "task_id" in resp.json()
-
-    @pytest.mark.asyncio
-    async def test_run_video_backed(self, ac, synthetic_video, synthetic_background, monkeypatch):
-        import model_tsm
-        import torch
-
-        class FakeModel(torch.nn.Module):
-            num_classes = 2
-            class_names = ["a", "b"]
-            def forward(self, x):
-                return torch.tensor([[0.5, 0.5]] * x.shape[0])
-            def eval(self):
-                return self
-            def to(self, device):
-                return self
-
-        monkeypatch.setattr(
-            model_tsm.TSMClassifier,
-            "load_from_checkpoint",
-            staticmethod(lambda *a, **kw: FakeModel()),
-        )
-
-        video_path, _ = synthetic_video
-        resp = await ac.post("/api/inference/run", json={
-            "checkpoint_path": "fake.ckpt",
-            "video_path": video_path,
-            "bg_path": synthetic_background,
-            "crop_params": {"box_size": 32, "difference_threshold": 5},
-        })
-        assert resp.status_code == 200
-        assert "task_id" in resp.json()
-
-    @pytest.mark.asyncio
-    async def test_run_validation(self, ac):
-        # Neither video_path nor frame_dir → 422
-        resp = await ac.post("/api/inference/run", json={"checkpoint_path": "x.ckpt"})
-        assert resp.status_code == 422
-
-    @pytest.mark.asyncio
-    async def test_status_not_found(self, ac):
-        resp = await ac.get("/api/inference/status/nonexistent-id")
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_results_not_found(self, ac):
-        resp = await ac.get("/api/inference/results/nonexistent-id")
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_results_not_complete(self, ac):
-        from backend.services.inference_service import _tasks
-        _tasks["test-inf"] = {
-            "status": "running",
-            "progress": 0,
-            "total": 0,
-            "cancel": False,
-            "error": None,
-            "results": None,
-        }
-        resp = await ac.get("/api/inference/results/test-inf")
-        assert resp.status_code == 400
-
-    @pytest.mark.asyncio
-    async def test_results_success(self, ac):
-        from backend.services.inference_service import _tasks
-        _tasks["test-done"] = {
-            "status": "completed",
-            "progress": 10,
-            "total": 10,
-            "cancel": False,
-            "error": None,
-            "results": {
-                "frames": [{"index": 2, "predictions": [0.8, 0.2], "uncertainty": 0.3, "predicted_class": 0}],
-                "class_names": ["walk", "rest"],
-                "total_frames": 10,
-                "frames_per_group": 3,
-            },
-        }
-        resp = await ac.get("/api/inference/results/test-done")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data["frames"]) == 1
-        assert data["class_names"] == ["walk", "rest"]
-
-    @pytest.mark.asyncio
-    async def test_stop_not_found(self, ac):
-        resp = await ac.post("/api/inference/stop/nonexistent-id")
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_stop_sets_cancel(self, ac):
-        from backend.services.inference_service import _tasks
-        _tasks["test-cancel"] = {
-            "status": "running",
-            "progress": 0,
-            "total": 0,
-            "cancel": False,
-            "error": None,
-            "results": None,
-        }
-        resp = await ac.post("/api/inference/stop/test-cancel")
-        assert resp.status_code == 200
-        assert _tasks["test-cancel"]["cancel"] is True
+    assert resp.status_code == 422
 
 
-# ── Project router (.rlt export/import/inspect) ───────────────────────────
+async def test_inference_results_unknown_task_is_404(client):
+    async with client as ac:
+        resp = await ac.get("/api/inference/results/nope")
+    assert resp.status_code == 404
 
-class TestProjectRouter:
-    @pytest.mark.asyncio
-    async def test_export_success(self, ac, sample_project, tmp_path):
-        project_dir, manifest = sample_project
-        out = str(tmp_path / "exported.rlt")
+
+async def test_inference_stop_unknown_task_is_404(client):
+    async with client as ac:
+        resp = await ac.post("/api/inference/stop/nope")
+    assert resp.status_code == 404
+
+
+async def test_inference_run_requires_a_pose_path(client):
+    async with client as ac:
+        resp = await ac.post("/api/inference/run",
+                             json={"checkpoint_path": "x.joblib"})
+    assert resp.status_code == 422, "pose_path is required by the schema"
+
+
+# ── Project router ────────────────────────────────────────────────────────
+
+async def test_export_and_inspect_rlt_over_http(client, sample_project, tmp_path):
+    project_dir, _ = sample_project
+    out = str(tmp_path / "api.rlt")
+    async with client as ac:
         resp = await ac.post("/api/project/export-rlt", json={
-            "project_dir": project_dir,
-            "output_path": out,
+            "project_dir": project_dir, "output_path": out, "package": False,
         })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["summary"]["labels"] == 2
-        assert data["summary"]["videos"] == len(manifest["videos"])
-        assert os.path.exists(out)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["summary"]["labels"] == 2
 
-    @pytest.mark.asyncio
-    async def test_export_missing_project_returns_404(self, ac, tmp_path):
-        empty = tmp_path / "empty"
-        empty.mkdir()
+        info = await ac.post("/api/project/inspect-rlt", json={"rlt_path": out})
+    assert info.status_code == 200
+    assert info.json()["labels"] == 2
+
+
+async def test_export_rlt_missing_project_is_404(client, tmp_path):
+    async with client as ac:
         resp = await ac.post("/api/project/export-rlt", json={
-            "project_dir": str(empty),
+            "project_dir": str(tmp_path / "nope"),
             "output_path": str(tmp_path / "x.rlt"),
         })
-        assert resp.status_code == 404
+    assert resp.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_export_validation(self, ac):
-        resp = await ac.post("/api/project/export-rlt", json={})
-        assert resp.status_code == 422
 
-    @pytest.mark.asyncio
-    async def test_import_round_trip(self, ac, sample_project, tmp_path):
-        project_dir, manifest = sample_project
-        out = str(tmp_path / "exported.rlt")
-        # Export first
-        await ac.post("/api/project/export-rlt", json={
-            "project_dir": project_dir,
-            "output_path": out,
-        })
-        # Then import into a fresh directory
-        dest = str(tmp_path / "imported")
-        resp = await ac.post("/api/project/import-rlt", json={
-            "rlt_path": out,
-            "output_dir": dest,
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["manifest"] == manifest
-        assert os.path.exists(os.path.join(dest, "project.json"))
-        assert os.path.exists(os.path.join(dest, "labels", "vid_a_bouts.csv"))
+# ── Route surface ─────────────────────────────────────────────────────────
 
-    @pytest.mark.asyncio
-    async def test_import_missing_file_returns_404(self, ac, tmp_path):
-        resp = await ac.post("/api/project/import-rlt", json={
-            "rlt_path": str(tmp_path / "nope.rlt"),
-            "output_dir": str(tmp_path / "out"),
-        })
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_inspect(self, ac, sample_project, tmp_path):
-        project_dir, manifest = sample_project
-        out = str(tmp_path / "exported.rlt")
-        await ac.post("/api/project/export-rlt", json={
-            "project_dir": project_dir,
-            "output_path": out,
-        })
-        resp = await ac.post("/api/project/inspect-rlt", json={"rlt_path": out})
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["labels"] == 2
-        assert info["videos"] == len(manifest["videos"])
-        assert info["manifest"]["name"] == manifest["name"]
+async def test_removed_tsm_routes_are_gone(client):
+    """The pixel pipeline's endpoints must not still be mounted."""
+    async with client as ac:
+        for path in ("/api/preprocess/background", "/api/preprocess/run",
+                     "/api/training/export-torchscript", "/api/training/benchmark-inference",
+                     "/api/training/check-coverage"):
+            resp = await ac.post(path, json={})
+            assert resp.status_code == 404, f"{path} still responds ({resp.status_code})"

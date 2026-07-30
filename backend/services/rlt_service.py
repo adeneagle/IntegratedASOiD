@@ -3,24 +3,29 @@ RLT file format service: HDF5 project files with .rlt extension.
 
 Two flavors, both HDF5:
   - **Lightweight** (default): manifest (project info, behaviors, config), video
-    references, and the hand-annotated label bouts only. Small and shareable —
-    modeled on SLEAP's base `.slp`. Frames/backgrounds/models are regenerated.
-  - **Package** (`package=True`): everything above PLUS the regenerable data —
-    preprocessed frames (gzip), background images, model checkpoints/exports, and
-    active-learning predictions. A self-contained, train-anywhere bundle —
-    modeled on SLEAP's `.pkg.slp`.
+    and pose *references*, and the hand-annotated labels only. Small and
+    shareable — modeled on SLEAP's base `.slp`. Features and models are
+    regenerated after import.
+  - **Package** (`package=True`): everything above PLUS the pose files
+    themselves, the extracted features, active-learning predictions, and model
+    checkpoints. A self-contained, train-anywhere bundle — modeled on SLEAP's
+    `.pkg.slp`.
 
 Import auto-detects which groups are present and restores accordingly.
+
+Packages are dramatically smaller than the TSM predecessor's: that format
+embedded a PNG per labeled frame, where this one embeds the pose file those
+frames were derived from.
 
 HDF5 layout:
     /                               (attr: rlt_version, packaged)
     /                               (attr: manifest — JSON string)
-    /labels/{video_id}              (dataset: UTF-8 CSV string of bouts)
-    /frames/{video_id}/{idx}        (dataset: uint8 PNG bytes, gzip)   [package]
-    /backgrounds/{video_id}         (dataset: uint8 PNG bytes, gzip)   [package]
+    /labels/{video_id}              (dataset: UTF-8 CSV string)
+    /pose/{video_id}                (dataset: uint8 file bytes, gzip)  [package]
+      .attrs["filename"]              original pose filename (keeps the extension)
+    /features/{iteration}/{video_id} (dataset: uint8 .npz bytes, gzip) [package]
     /predictions/{video_id}         (dataset: UTF-8 JSON string)       [package]
-    /models/checkpoints/{name}      (dataset: uint8 binary blob)       [package]
-    /models/exports/{name}          (dataset: uint8 binary blob)       [package]
+    /models/checkpoints/{name}      (dataset: uint8 .joblib blob)      [package]
 """
 
 import json
@@ -32,7 +37,12 @@ import h5py
 import numpy as np
 
 
-RLT_VERSION = 4
+RLT_VERSION = 5
+# v5 replaced the pixel-pipeline groups (/frames, /backgrounds) with /pose and
+# /features. Older files describe a project this app cannot act on — they carry
+# cropped frame images but no pose data — so they are rejected rather than
+# imported into a half-usable state.
+MIN_SUPPORTED_VERSION = 5
 
 
 # ── Export (folder → .rlt) ────────────────────────────────────────────────
@@ -51,9 +61,9 @@ def export_rlt(
     Args:
         project_dir: Path to the project folder (must contain project.json).
         output_path: Where to write the .rlt file.
-        package:     If True, also embed frames, backgrounds, and models
-                     (a self-contained bundle). If False (default), labels +
-                     manifest only.
+        package:     If True, also embed pose files, features, predictions and
+                     models (a self-contained bundle). If False (default),
+                     labels + manifest only.
         progress_cb: Optional callback(stage: str, pct: float).
 
     Returns:
@@ -70,11 +80,10 @@ def export_rlt(
     summary = {
         "videos": len(manifest.get("videos", [])),
         "labels": 0,
-        "frames": 0,
-        "backgrounds": 0,
+        "pose": 0,
+        "features": 0,
         "predictions": 0,
         "checkpoints": 0,
-        "exports": 0,
         "packaged": package,
     }
 
@@ -103,29 +112,38 @@ def export_rlt(
             _report("done", 100)
             return summary
 
-        # ── Frames (package only) ─────────────────────────────────────
-        frames_grp = hf.create_group("frames")
-        frames_dir = project_dir / "frames"
-        if frames_dir.is_dir():
-            vdirs = sorted(d for d in frames_dir.iterdir() if d.is_dir())
-            for vi, vdir in enumerate(vdirs):
-                vid_grp = frames_grp.create_group(vdir.name)
-                for png in sorted(vdir.glob("*.png"), key=lambda p: p.stem):
-                    raw = np.frombuffer(png.read_bytes(), dtype=np.uint8)
-                    vid_grp.create_dataset(png.stem, data=raw, compression="gzip", compression_opts=4)
-                    summary["frames"] += 1
-                _report("frames", (vi + 1) / max(len(vdirs), 1) * 100)
+        # ── Pose files (package only) ─────────────────────────────────
+        # Embedded by value so the bundle trains anywhere. The original filename
+        # rides along as an attribute because the loader dispatches on extension
+        # (.csv = DeepLabCut, .h5 = SLEAP, .mat/.txt = OpenMonkeyStudio).
+        pose_grp = hf.create_group("pose")
+        videos = manifest.get("videos", [])
+        for vi, video in enumerate(videos):
+            pose_path = video.get("pose")
+            if not pose_path or not os.path.exists(pose_path):
+                continue
+            raw = np.frombuffer(Path(pose_path).read_bytes(), dtype=np.uint8)
+            ds = pose_grp.create_dataset(
+                video["id"], data=raw, compression="gzip", compression_opts=4
+            )
+            ds.attrs["filename"] = os.path.basename(pose_path)
+            summary["pose"] += 1
+            _report("pose", (vi + 1) / max(len(videos), 1) * 100)
 
-        # ── Backgrounds (package only) ────────────────────────────────
-        bg_grp = hf.create_group("backgrounds")
-        bg_dir = project_dir / "backgrounds"
-        if bg_dir.is_dir():
-            bgs = sorted(bg_dir.glob("*.png"))
-            for i, bg in enumerate(bgs):
-                raw = np.frombuffer(bg.read_bytes(), dtype=np.uint8)
-                bg_grp.create_dataset(bg.stem.replace("bg_", ""), data=raw, compression="gzip", compression_opts=4)
-                summary["backgrounds"] += 1
-                _report("backgrounds", (i + 1) / max(len(bgs), 1) * 100)
+        # ── Features (package only) ───────────────────────────────────
+        # Every iteration-N/features/ directory, so a refined project keeps its
+        # history rather than only the latest round.
+        feats_grp = hf.create_group("features")
+        iter_dirs = sorted(
+            d for d in project_dir.glob("iteration-*") if (d / "features").is_dir()
+        )
+        for di, idir in enumerate(iter_dirs):
+            sub = feats_grp.create_group(idir.name)
+            for npz in sorted((idir / "features").glob("*.npz")):
+                raw = np.frombuffer(npz.read_bytes(), dtype=np.uint8)
+                sub.create_dataset(npz.stem, data=raw, compression="gzip", compression_opts=4)
+                summary["features"] += 1
+            _report("features", (di + 1) / max(len(iter_dirs), 1) * 100)
 
         # ── Predictions (package only) ────────────────────────────────
         pred_grp = hf.create_group("predictions")
@@ -139,16 +157,15 @@ def export_rlt(
 
         # ── Models (package only) ─────────────────────────────────────
         models_grp = hf.create_group("models")
-        for sub, key in (("checkpoints", "checkpoints"), ("exports", "exports")):
-            grp = models_grp.create_group(sub)
-            mdir = project_dir / "models" / sub
-            if mdir.is_dir():
-                files = sorted(p for p in mdir.glob("*") if p.is_file())
-                for i, f in enumerate(files):
-                    raw = np.frombuffer(f.read_bytes(), dtype=np.uint8)
-                    grp.create_dataset(f.name, data=raw)
-                    summary[key] += 1
-                    _report("models", (i + 1) / max(len(files), 1) * 100)
+        ckpt_grp = models_grp.create_group("checkpoints")
+        mdir = project_dir / "models" / "checkpoints"
+        if mdir.is_dir():
+            files = sorted(p for p in mdir.glob("*.joblib") if p.is_file())
+            for i, f in enumerate(files):
+                raw = np.frombuffer(f.read_bytes(), dtype=np.uint8)
+                ckpt_grp.create_dataset(f.name, data=raw, compression="gzip", compression_opts=4)
+                summary["checkpoints"] += 1
+                _report("models", (i + 1) / max(len(files), 1) * 100)
 
         _report("done", 100)
 
@@ -158,6 +175,19 @@ def export_rlt(
 # ── Import (.rlt → folder) ────────────────────────────────────────────────
 
 
+def _check_version(hf) -> int:
+    version = int(hf.attrs.get("rlt_version", 1))
+    if version < MIN_SUPPORTED_VERSION:
+        raise ValueError(
+            f"This .rlt is version {version}, from the video/TSM version of the app. "
+            f"It contains cropped frame images but no pose data, so it cannot be "
+            f"opened here (this app needs version {MIN_SUPPORTED_VERSION} or newer). "
+            f"Re-export it from the original app, or start a new project and import "
+            f"its label CSVs."
+        )
+    return version
+
+
 def import_rlt(
     rlt_path: str,
     output_dir: str,
@@ -165,9 +195,13 @@ def import_rlt(
     progress_cb: Optional[callable] = None,
 ) -> dict:
     """
-    Unpack an .rlt into a project directory. Restores labels always, and
-    frames/backgrounds/models if the file is a package. Video paths from the
-    manifest are preserved (re-link on the new machine if they don't resolve).
+    Unpack an .rlt into a project directory. Restores labels always, plus pose
+    files, features, predictions and models if the file is a package.
+
+    Video paths from the manifest are preserved (re-link on the new machine if
+    they don't resolve). Pose paths, in contrast, are *rewritten* to point at the
+    extracted copies — the bundle carries pose by value, so the imported project
+    is immediately trainable without re-linking.
 
     Returns the manifest dict.
     """
@@ -178,42 +212,51 @@ def import_rlt(
         if progress_cb:
             progress_cb(stage, pct)
 
-    def _write_blobs(group, dest_dir, namer):
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        keys = list(group.keys())
-        for i, key in enumerate(keys):
-            data = group[key][()]
-            (dest_dir / namer(key)).write_bytes(data.tobytes())
-            _report(dest_dir.name, (i + 1) / max(len(keys), 1) * 100)
-
     with h5py.File(rlt_path, "r") as hf:
+        _check_version(hf)
         manifest = json.loads(hf.attrs["manifest"])
 
-        for sub in ("labels", "frames", "backgrounds", "predictions",
-                    os.path.join("models", "checkpoints"),
-                    os.path.join("models", "exports")):
+        for sub in ("labels", "pose", "predictions",
+                    os.path.join("iteration-0", "features"),
+                    os.path.join("models", "checkpoints")):
             (output_dir / sub).mkdir(parents=True, exist_ok=True)
 
         # Labels
         if "labels" in hf:
             labels_dir = output_dir / "labels"
-            for i, vid_id in enumerate(hf["labels"].keys()):
+            for vid_id in hf["labels"].keys():
                 content = hf["labels"][vid_id][()]
                 if isinstance(content, bytes):
                     content = content.decode("utf-8")
                 (labels_dir / f"{vid_id}_bouts.csv").write_text(content, encoding="utf-8")
+            _report("labels", 100)
 
-        # Frames (package)
-        if "frames" in hf:
-            frames_dir = output_dir / "frames"
-            vids = list(hf["frames"].keys())
-            for vi, vid_id in enumerate(vids):
-                _write_blobs(hf["frames"][vid_id], frames_dir / vid_id, lambda k: f"{k}.png")
-                _report("frames", (vi + 1) / max(len(vids), 1) * 100)
+        # Pose (package) — extract and repoint the manifest at the local copy.
+        if "pose" in hf:
+            pose_dir = output_dir / "pose"
+            by_id = {v.get("id"): v for v in manifest.get("videos", [])}
+            keys = list(hf["pose"].keys())
+            for i, vid_id in enumerate(keys):
+                ds = hf["pose"][vid_id]
+                filename = ds.attrs.get("filename", f"{vid_id}.csv")
+                if isinstance(filename, bytes):
+                    filename = filename.decode("utf-8")
+                dest = pose_dir / filename
+                dest.write_bytes(ds[()].tobytes())
+                if vid_id in by_id:
+                    by_id[vid_id]["pose"] = str(dest.resolve())
+                _report("pose", (i + 1) / max(len(keys), 1) * 100)
 
-        # Backgrounds (package)
-        if "backgrounds" in hf:
-            _write_blobs(hf["backgrounds"], output_dir / "backgrounds", lambda k: f"bg_{k}.png")
+        # Features (package)
+        if "features" in hf:
+            iters = list(hf["features"].keys())
+            for ii, iter_name in enumerate(iters):
+                dest_dir = output_dir / iter_name / "features"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                for vid_id in hf["features"][iter_name].keys():
+                    data = hf["features"][iter_name][vid_id][()]
+                    (dest_dir / f"{vid_id}.npz").write_bytes(data.tobytes())
+                _report("features", (ii + 1) / max(len(iters), 1) * 100)
 
         # Predictions (package)
         if "predictions" in hf:
@@ -223,13 +266,16 @@ def import_rlt(
                 if isinstance(content, bytes):
                     content = content.decode("utf-8")
                 (pred_dir / f"{vid_id}.json").write_text(content, encoding="utf-8")
+            _report("predictions", 100)
 
         # Models (package)
-        if "models" in hf:
-            if "checkpoints" in hf["models"]:
-                _write_blobs(hf["models"]["checkpoints"], output_dir / "models" / "checkpoints", lambda k: k)
-            if "exports" in hf["models"]:
-                _write_blobs(hf["models"]["exports"], output_dir / "models" / "exports", lambda k: k)
+        if "models" in hf and "checkpoints" in hf["models"]:
+            dest_dir = output_dir / "models" / "checkpoints"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for name in hf["models"]["checkpoints"].keys():
+                data = hf["models"]["checkpoints"][name][()]
+                (dest_dir / name).write_bytes(data.tobytes())
+            _report("models", 100)
 
         (output_dir / "project.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -245,20 +291,23 @@ def import_rlt(
 def inspect_rlt(rlt_path: str) -> dict:
     """Read metadata from an .rlt without extracting. Returns counts + flags."""
     with h5py.File(rlt_path, "r") as hf:
+        _check_version(hf)
         manifest = json.loads(hf.attrs["manifest"])
-        frame_count = 0
-        if "frames" in hf:
-            for vid_id in hf["frames"]:
-                frame_count += len(hf["frames"][vid_id])
+        feature_count = 0
+        if "features" in hf:
+            for iter_name in hf["features"]:
+                feature_count += len(hf["features"][iter_name])
         return {
             "version": int(hf.attrs.get("rlt_version", 1)),
-            "packaged": bool(hf.attrs.get("packaged", "frames" in hf)),
+            "packaged": bool(hf.attrs.get("packaged", "pose" in hf)),
             "manifest": manifest,
             "videos": len(manifest.get("videos", [])),
             "labels": len(hf["labels"]) if "labels" in hf else 0,
-            "frames": frame_count,
-            "backgrounds": len(hf["backgrounds"]) if "backgrounds" in hf else 0,
+            "pose": len(hf["pose"]) if "pose" in hf else 0,
+            "features": feature_count,
             "predictions": len(hf["predictions"]) if "predictions" in hf else 0,
-            "checkpoints": len(hf["models"]["checkpoints"]) if "models" in hf and "checkpoints" in hf["models"] else 0,
-            "exports": len(hf["models"]["exports"]) if "models" in hf and "exports" in hf["models"] else 0,
+            "checkpoints": (
+                len(hf["models"]["checkpoints"])
+                if "models" in hf and "checkpoints" in hf["models"] else 0
+            ),
         }

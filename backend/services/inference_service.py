@@ -1,21 +1,31 @@
-"""
-Inference service: loads a trained TSMClassifier checkpoint and runs per-frame
-inference on preprocessed flat frame directories. Computes normalized entropy
-for active learning uncertainty estimation.
+"""Inference service: per-frame predictions + uncertainty from a pose file.
+
+The response shape is **deliberately identical** to the TSM predecessor's:
+
+    {"frames": [{"index", "predicted_class", "uncertainty"}, ...],
+     "class_names": [...]}
+
+That is what lets the entire Active Learning panel in `renderer.js` — the
+uncertainty heatmap, misclassification ticks, "jump to lowest confidence",
+`applyAlResults`, saved-prediction round-tripping — carry over untouched.
+
+Uncertainty is the normalized Shannon entropy of the RandomForest's class
+probabilities, the same 0..1 metric the softmax version produced.
 """
 
-import math
+from __future__ import annotations
+
 import os
 import threading
 import uuid
 from typing import Optional
 
-import cv2
+import joblib
 import numpy as np
-import torch
-import torch.nn.functional as F
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+
+from backend.asoid_core import pose_io
+from backend.asoid_core.active_learning import fingerprint_bodyparts
+from backend.asoid_core.predict import frameshift_predict_proba, normalized_entropy
 
 # ── Task registry ──────────────────────────────────────────────────────────
 
@@ -31,373 +41,287 @@ def cancel_all():
         task["cancel"] = True
 
 
-# ── Inference logic ────────────────────────────────────────────────────────
+# ── Model loading ──────────────────────────────────────────────────────────
 
-def _build_val_transform(image_size: int = 224):
-    return A.Compose([
-        A.Resize(image_size, image_size),
-        A.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-            max_pixel_value=255.0,
-        ),
-        ToTensorV2(),
-    ], additional_targets={f"image{i}": "image" for i in range(1, 10)})
-
-
-def _load_frame(path: str) -> np.ndarray:
-    """Load a single frame as RGB numpy array."""
-    img = cv2.imread(path)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read frame: {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+def load_model(checkpoint_path: str) -> dict:
+    """Load a .joblib checkpoint bundle written by the training service."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    bundle = joblib.load(checkpoint_path)
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        raise ValueError(
+            f"{os.path.basename(checkpoint_path)} is not an A-SOID Desktop checkpoint."
+        )
+    return bundle
 
 
-def run_inference(
-    checkpoint_path: str,
-    frame_dir: str,
-    frames_per_group: int = 3,
-    image_size: int = 224,
-    model_config: dict | None = None,
-    on_progress: callable = None,
-    cancel_flag: callable = None,
-) -> dict:
+def check_bodyparts(bundle: dict, bodyparts: list[str], is_3d: bool) -> None:
+    """Reject a body-part selection the model was not trained on.
+
+    Feature columns are built from every *pair* of selected body parts, so a
+    different selection shifts the meaning of every column. When the widths
+    happen to coincide this produces confident nonsense rather than an error —
+    the failure upstream A-SOID patched in commit 1710d15. Fail loudly instead.
     """
-    Run per-frame inference on a flat frame directory.
+    expected = bundle.get("bodypart_fingerprint")
+    if not expected:
+        return  # older checkpoint without a fingerprint; nothing to check against
+    actual = fingerprint_bodyparts(bodyparts, is_3d)
+    if actual != expected:
+        raise ValueError(
+            "This model was trained on a different body-part selection "
+            f"({', '.join(bundle.get('bodyparts') or [])}) than the one configured "
+            f"({', '.join(bodyparts)}). Re-extract features with the model's "
+            "selection, or train a new model."
+        )
 
-    Args:
-        checkpoint_path: Path to .ckpt file
-        frame_dir: Directory containing 0.png, 1.png, ... (flat)
-        frames_per_group: Number of frames per temporal group (default 3)
-        image_size: Resize dimension
-        model_config: Override model hyperparameters (tsm_stages, etc.)
 
-    Returns:
-        dict with 'frames' list and 'class_names'
-    """
-    from model_tsm import TSMClassifier
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Load model
-    load_kwargs = model_config or {}
-    model = TSMClassifier.load_from_checkpoint(
-        checkpoint_path, map_location=device, strict=False, **load_kwargs
-    )
-    model.to(device)
-    model.eval()
-
-    num_classes = model.num_classes
-    class_names = model.class_names
-
-    # Discover frames
-    frame_files = sorted(
-        [f for f in os.listdir(frame_dir) if f.endswith(".png")],
-        key=lambda x: int(os.path.splitext(x)[0])
-    )
-    total_frames = len(frame_files)
-
-    # Build transform
-    transform = _build_val_transform(image_size)
-
-    results = []
-    T = frames_per_group
-
-    with torch.no_grad():
-        for idx in range(T - 1, total_frames):
-            if cancel_flag and cancel_flag():
-                break
-
-            # Construct triplet: [idx-(T-1), ..., idx-1, idx]
-            triplet_files = [frame_files[idx - (T - 1 - j)] for j in range(T)]
-            triplet_paths = [os.path.join(frame_dir, f) for f in triplet_files]
-
-            # Load frames
-            images = [_load_frame(p) for p in triplet_paths]
-
-            # Apply transforms consistently across the group
-            targets = {"image": images[0]}
-            for i in range(1, len(images)):
-                targets[f"image{i}"] = images[i]
-            transformed = transform(**targets)
-
-            tensors = [transformed["image"]]
-            for i in range(1, len(images)):
-                tensors.append(transformed[f"image{i}"])
-
-            # Stack into (1, T, C, H, W)
-            triplet_tensor = torch.stack(tensors).unsqueeze(0).to(device)
-
-            # Forward pass
-            logits = model(triplet_tensor)
-            probs = F.softmax(logits, dim=1).squeeze(0)  # (K,)
-
-            # Entropy-based uncertainty
-            entropy = -(probs * torch.log(probs + 1e-10)).sum()
-            max_entropy = math.log(num_classes)
-            normalized_entropy = (entropy / max_entropy).item() if max_entropy > 0 else 0.0
-
-            predicted_class = probs.argmax().item()
-
-            results.append({
-                "index": idx,
-                "predictions": probs.cpu().tolist(),
-                "uncertainty": normalized_entropy,
-                "predicted_class": predicted_class,
-            })
-
-            if on_progress:
-                on_progress(len(results), total_frames - (T - 1))
-
-    return {
-        "frames": results,
-        "class_names": class_names,
-        "total_frames": total_frames,
-        "frames_per_group": T,
-    }
-
+# ── Inference ──────────────────────────────────────────────────────────────
 
 def _wanted_set(frame_ranges):
-    """Build the set of native frame indices to predict from inclusive ranges.
+    """Inclusive [start, end] native-index pairs → a set of frame indices.
 
-    ``frame_ranges`` is a list of ``[start, end]`` pairs (inclusive, native frame
-    indices). Returns ``None`` when no ranges are given (meaning: predict on every
-    frame). Mirrors ``preprocess_service._wanted_set``.
+    None means "the whole video" (kept distinct from an empty set, so an empty
+    range list can still mean "nothing").
     """
     if not frame_ranges:
         return None
     wanted = set()
-    for r in frame_ranges:
-        start, end = int(r[0]), int(r[1])
+    for pair in frame_ranges:
+        if not pair or len(pair) < 2:
+            continue
+        start, end = int(pair[0]), int(pair[1])
         if end < start:
             start, end = end, start
-        start = max(0, start)
-        for i in range(start, end + 1):
-            wanted.add(i)
+        wanted.update(range(start, end + 1))
     return wanted
 
 
-def run_inference_video(
+def run_inference_pose(
     checkpoint_path: str,
-    video_path: str,
-    bg_path: str | None,
-    crop_params: dict,
-    frames_per_group: int = 3,
-    image_size: int = 224,
-    num_frames_bg: int = 500,
-    model_config: dict | None = None,
+    pose_path: str,
+    origin: str,
+    bodyparts: list[str] | None = None,
+    llh_value: float = 0.6,
+    animals: list[str] | None = None,
+    multi_animal: bool = False,
     frame_ranges: list | None = None,
-    on_progress: callable = None,
-    cancel_flag: callable = None,
+    progress_cb=None,
+    should_cancel=None,
 ) -> dict:
-    """
-    Run per-frame inference by decoding + cropping the video on the fly — no
-    pre-extracted frame directory. Frames are cropped with the SAME pipeline as
-    training (FindRatBoundingBox + background), so the model sees the same
-    distribution. Results are indexed by native frame number, matching the
-    label/timeline index space.
+    """Predict a behavior + uncertainty for every native frame of a pose file."""
+    bundle = load_model(checkpoint_path)
+    model = bundle["model"]
+    class_names = list(bundle.get("class_names") or [])
+    frames2integ = int(bundle.get("frames2integ", 30))
+    # Default to the selection recorded on the checkpoint — the only one
+    # guaranteed to line up with its feature space.
+    bodyparts = bodyparts or list(bundle.get("bodyparts") or [])
+    if not bodyparts:
+        raise ValueError("No body parts specified and the checkpoint records none.")
 
-    If ``frame_ranges`` (inclusive [start, end] native-index pairs) is given,
-    predictions are emitted only for those frames — used by Active Learning to
-    scope inference to a segment or to the already-labeled frames. Decoding still
-    starts at frame 0 to keep native-index alignment, but the expensive crop +
-    model forward are skipped for frames outside the clip lookback of any wanted
-    frame, and decoding stops once the last wanted frame is passed.
-    """
-    from model_tsm import TSMClassifier
-    from tune_cropping import FindRatBoundingBox, get_background_avg, pop_resize_factor, resize_frame
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    load_kwargs = model_config or {}
-    model = TSMClassifier.load_from_checkpoint(
-        checkpoint_path, map_location=device, strict=False, **load_kwargs
+    pose_array, is_3d, _perc = pose_io.load_and_filter(
+        pose_path, origin, bodyparts,
+        llh_value=llh_value, animals=animals, multi_animal=multi_animal,
     )
-    model.to(device)
-    model.eval()
+    check_bodyparts(bundle, bodyparts, is_3d)
 
-    num_classes = model.num_classes
-    class_names = model.class_names
+    n_frames = pose_array.shape[0]
 
-    bg = None
-    if bg_path:
-        loaded = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)
-        if loaded is not None:
-            bg = loaded.astype(np.float32)
-        else:
-            # cv2.imread silently returns None for a missing/unreadable file;
-            # fall back to computing the background from the video itself rather
-            # than crashing with "'NoneType' object has no attribute 'astype'".
-            print(f"[inference] background not readable at {bg_path}; "
-                  f"computing it from the video instead.", flush=True)
-    if bg is None:
-        bg = get_background_avg(video_path, num_frames_bg)
-    # Apply the same full-frame pre-resize used in training so crops match.
-    crop_params, resize_factor = pop_resize_factor(crop_params)
-    bg = resize_frame(bg, resize_factor)
-    cropper = FindRatBoundingBox(bg, **crop_params)
+    def _progress(done, total):
+        if should_cancel is not None and should_cancel():
+            raise InterruptedError("cancelled")
+        if progress_cb is not None:
+            progress_cb(done, total)
 
-    transform = _build_val_transform(image_size)
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    labels, proba = frameshift_predict_proba(
+        pose_array, model, frames2integ, is_3d=is_3d, progress_cb=_progress
+    )
 
-    T = frames_per_group
+    if proba.shape[1] != len(class_names):
+        # Probability columns follow model.classes_, which omits classes absent
+        # from the training set; pad back out so predicted_class indexes into
+        # class_names the way the renderer assumes.
+        full = np.zeros((proba.shape[0], len(class_names)))
+        for col, cls in enumerate(model.classes_):
+            if 0 <= int(cls) < len(class_names):
+                full[:, int(cls)] = proba[:, col]
+        proba = full
 
-    # Optional scoping: only emit predictions for frames in `wanted`.
+    uncertainty = normalized_entropy(proba)
+
     wanted = _wanted_set(frame_ranges)
-    wanted_max = max(wanted) if wanted else None
+    frames = []
+    for i in range(n_frames):
+        if wanted is not None and i not in wanted:
+            continue
+        frames.append({
+            "index": i,
+            "predicted_class": int(labels[i]),
+            "uncertainty": float(uncertainty[i]),
+        })
 
-    def _is_needed(i: int) -> bool:
-        # Frame i must be cropped if it falls within the T-frame clip of any
-        # wanted frame (i.e. one of i, i+1, ..., i+T-1 is wanted).
-        if wanted is None:
-            return True
-        return any((i + k) in wanted for k in range(T))
-
-    if wanted is None:
-        target_total = max(0, total_frames - (T - 1))
-    else:
-        # Wanted frames before index T-1 can't form a full clip, so they're not emitted.
-        target_total = sum(1 for i in wanted if i >= T - 1)
-
-    window = []  # rolling window of the last T cropped RGB frames
-    results = []
-    frame_index = 0
-
-    with torch.no_grad():
-        while True:
-            if cancel_flag and cancel_flag():
-                break
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if wanted is not None and frame_index > wanted_max:
-                break  # past the last wanted frame — nothing more to predict
-
-            if _is_needed(frame_index):
-                if resize_factor != 1.0:
-                    frame = cv2.resize(frame, (bg.shape[1], bg.shape[0]), interpolation=cv2.INTER_AREA)
-                # Crop, then match _load_frame's BGR->RGB conversion exactly.
-                *_, cropped = cropper(frame)
-                rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                window.append(rgb)
-                if len(window) > T:
-                    window.pop(0)
-            else:
-                # Gap before the next wanted frame: restart the clip and the
-                # crop-center smoothing so the next region begins cleanly.
-                window = []
-                cropper.smoothed_center = None
-
-            emit = wanted is None or frame_index in wanted
-            if emit and len(window) == T:
-                targets = {"image": window[0]}
-                for i in range(1, T):
-                    targets[f"image{i}"] = window[i]
-                transformed = transform(**targets)
-                tensors = [transformed["image"]]
-                for i in range(1, T):
-                    tensors.append(transformed[f"image{i}"])
-                clip = torch.stack(tensors).unsqueeze(0).to(device)
-
-                logits = model(clip)
-                probs = F.softmax(logits, dim=1).squeeze(0)
-                entropy = -(probs * torch.log(probs + 1e-10)).sum()
-                max_entropy = math.log(num_classes)
-                normalized_entropy = (entropy / max_entropy).item() if max_entropy > 0 else 0.0
-
-                results.append({
-                    "index": frame_index,
-                    "predictions": probs.cpu().tolist(),
-                    "uncertainty": normalized_entropy,
-                    "predicted_class": probs.argmax().item(),
-                })
-                if on_progress:
-                    on_progress(len(results), target_total)
-
-            frame_index += 1
-
-    cap.release()
     return {
-        "frames": results,
+        "frames": frames,
         "class_names": class_names,
-        "total_frames": frame_index,
-        "frames_per_group": T,
+        "checkpoint_path": checkpoint_path,
+        "bin_width": int(bundle.get("bin_width", max(1, frames2integ // 10))),
     }
 
 
-# ── Async task management ─────────────────────────────────────────────────
-
 def start_inference(
     checkpoint_path: str,
-    frame_dir: str | None = None,
-    frames_per_group: int = 3,
-    image_size: int = 224,
-    model_config: dict | None = None,
-    video_path: str | None = None,
-    bg_path: str | None = None,
-    crop_params: dict | None = None,
+    pose_path: str,
+    origin: str = "deeplabcut",
+    bodyparts: list[str] | None = None,
+    llh_value: float = 0.6,
+    animals: list[str] | None = None,
+    multi_animal: bool = False,
     frame_ranges: list | None = None,
 ) -> str:
-    """
-    Launch inference in a background thread. Returns task_id.
-
-    If ``video_path`` is given, frames are decoded + cropped on the fly
-    (Active Learning). Otherwise it reads a pre-extracted ``frame_dir``.
-
-    ``frame_ranges`` (video path only) scopes predictions to inclusive
-    [start, end] native-index pairs — a segment or the labeled frames.
-    """
+    """Start inference in a background thread. Returns task_id."""
     task_id = str(uuid.uuid4())
     task = {
-        "status": "running",
+        "status": "starting",
         "progress": 0,
         "total": 0,
-        "cancel": False,
         "error": None,
+        "cancel": False,
         "results": None,
     }
     _tasks[task_id] = task
 
     def _run():
         try:
-            def on_progress(done, total):
+            task["status"] = "running"
+
+            def progress_cb(done, total):
                 task["progress"] = done
                 task["total"] = total
 
-            if video_path:
-                result = run_inference_video(
-                    checkpoint_path=checkpoint_path,
-                    video_path=video_path,
-                    bg_path=bg_path,
-                    crop_params=crop_params or {},
-                    frames_per_group=frames_per_group,
-                    image_size=image_size,
-                    model_config=model_config,
-                    frame_ranges=frame_ranges,
-                    on_progress=on_progress,
-                    cancel_flag=lambda: task["cancel"],
-                )
-            else:
-                result = run_inference(
-                    checkpoint_path=checkpoint_path,
-                    frame_dir=frame_dir,
-                    frames_per_group=frames_per_group,
-                    image_size=image_size,
-                    model_config=model_config,
-                    on_progress=on_progress,
-                    cancel_flag=lambda: task["cancel"],
-                )
-
-            if task["cancel"]:
-                task["status"] = "cancelled"
-            else:
-                task["status"] = "completed"
-                task["results"] = result
+            results = run_inference_pose(
+                checkpoint_path=checkpoint_path,
+                pose_path=pose_path,
+                origin=origin,
+                bodyparts=bodyparts,
+                llh_value=llh_value,
+                animals=animals,
+                multi_animal=multi_animal,
+                frame_ranges=frame_ranges,
+                progress_cb=progress_cb,
+                should_cancel=lambda: task["cancel"],
+            )
+            task["results"] = results
+            task["progress"] = len(results["frames"])
+            task["total"] = len(results["frames"])
+            task["status"] = "completed"
+        except InterruptedError:
+            task["status"] = "cancelled"
         except Exception as e:
+            task["error"] = f"{type(e).__name__}: {e}"
             task["status"] = "error"
-            task["error"] = str(e)
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+    threading.Thread(target=_run, daemon=True).start()
     return task_id
+
+
+# ── Batch prediction (ported from A-SOID's F_predict) ──────────────────────
+
+def start_batch_inference(
+    checkpoint_path: str,
+    pose_paths: list[str],
+    output_dir: str,
+    origin: str = "deeplabcut",
+    bodyparts: list[str] | None = None,
+    llh_value: float = 0.6,
+    animals: list[str] | None = None,
+    multi_animal: bool = False,
+) -> str:
+    """Apply a trained model to a set of unlabeled pose files.
+
+    Writes one `<name>_predictions.csv` per input into `output_dir`, in the same
+    `time,<behavior>…` one-hot layout the labeling UI reads — so a batch result
+    can be imported straight back in as labels for review.
+    """
+    task_id = str(uuid.uuid4())
+    task = {
+        "status": "starting",
+        "progress": 0,
+        "total": len(pose_paths),
+        "error": None,
+        "cancel": False,
+        "results": None,
+    }
+    _tasks[task_id] = task
+
+    def _run():
+        try:
+            task["status"] = "running"
+            os.makedirs(output_dir, exist_ok=True)
+            written = []
+
+            for i, pose_path in enumerate(pose_paths):
+                if task["cancel"]:
+                    task["status"] = "cancelled"
+                    return
+                results = run_inference_pose(
+                    checkpoint_path=checkpoint_path,
+                    pose_path=pose_path,
+                    origin=origin,
+                    bodyparts=bodyparts,
+                    llh_value=llh_value,
+                    animals=animals,
+                    multi_animal=multi_animal,
+                    should_cancel=lambda: task["cancel"],
+                )
+                stem = os.path.splitext(os.path.basename(pose_path))[0]
+                out_path = os.path.join(output_dir, f"{stem}_predictions.csv")
+                _write_prediction_csv(out_path, results)
+                written.append({
+                    "pose_path": pose_path,
+                    "output_path": out_path,
+                    "n_frames": len(results["frames"]),
+                    "summary": _ethogram_summary(results),
+                })
+                task["progress"] = i + 1
+
+            task["results"] = {"files": written, "output_dir": output_dir}
+            task["status"] = "completed"
+        except Exception as e:
+            task["error"] = f"{type(e).__name__}: {e}"
+            task["status"] = "error"
+
+    threading.Thread(target=_run, daemon=True).start()
+    return task_id
+
+
+def _write_prediction_csv(path: str, results: dict) -> None:
+    class_names = results["class_names"]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("time," + ",".join(class_names) + "\n")
+        for frame in results["frames"]:
+            row = ["0"] * len(class_names)
+            cls = frame["predicted_class"]
+            if 0 <= cls < len(class_names):
+                row[cls] = "1"
+            f.write(f"{frame['index']}," + ",".join(row) + "\n")
+
+
+def _ethogram_summary(results: dict) -> dict:
+    """Frame counts and mean uncertainty per predicted class."""
+    class_names = results["class_names"]
+    counts = {name: 0 for name in class_names}
+    unc_sum = {name: 0.0 for name in class_names}
+    for frame in results["frames"]:
+        cls = frame["predicted_class"]
+        if 0 <= cls < len(class_names):
+            name = class_names[cls]
+            counts[name] += 1
+            unc_sum[name] += frame["uncertainty"]
+    return {
+        name: {
+            "frames": counts[name],
+            "mean_uncertainty": round(unc_sum[name] / counts[name], 4) if counts[name] else 0.0,
+        }
+        for name in class_names
+    }

@@ -118,8 +118,12 @@
       id,
       path: videoPath,
       labels: "labels/" + id + "_bouts.csv",
-      frames: "frames/" + id + "/",
-      background: "backgrounds/bg_" + id + ".png"
+      // `pose` is an ABSOLUTE path to the DLC/SLEAP file, like `path` — pose
+      // files are large and usually live beside the video, so they stay where
+      // they are rather than being copied into the project.
+      pose: null,
+      // Extracted features are project-owned and iteration-scoped.
+      features: "iteration-0/features/" + id + ".npz"
     };
     activeProject.manifest.videos.push(entry);
     saveManifest();
@@ -134,6 +138,33 @@
       entry.path = newPath;
       saveManifest();
     }
+  }
+
+  // Attach (or re-link) the pose-estimation file backing a video. Everything
+  // downstream — features, training, inference, the skeleton overlay — reads
+  // the pose through here, so a video without one simply can't be trained on.
+  function setVideoPose(videoName, posePath) {
+    if (!activeProject) return null;
+    const entry = getVideoEntry(videoName);
+    if (!entry) return null;
+    if (entry.pose !== posePath) {
+      entry.pose = posePath;
+      saveManifest();
+    }
+    return entry;
+  }
+
+  function getVideoPose(videoName) {
+    const entry = getVideoEntry(videoName);
+    return (entry && entry.pose) || null;
+  }
+
+  // Absolute path to a video's extracted features for the given iteration.
+  function getVideoFeaturesAbs(videoName, iterationDir) {
+    if (!activeProject) return null;
+    const id = sanitizeId(videoName);
+    const iter = iterationDir || "iteration-0";
+    return toAbsolute(iter + "/features/" + id + ".npz");
   }
 
   function removeVideoFromManifest(videoId) {
@@ -266,23 +297,7 @@
     return isAbsolutePath(relOrAbs) ? relOrAbs : activeProject.rootDir + "/" + relOrAbs;
   };
 
-  // Store a background path on a video entry (relative to the project root when
-  // possible, so the project stays portable).
-  function setVideoBackground(videoName, absPath) {
-    if (!activeProject || !absPath) return;
-    const entry = getVideoEntry(videoName);
-    if (!entry) return;
-    const root = activeProject.rootDir.replace(/\\/g, "/").replace(/\/$/, "");
-    const norm = String(absPath).replace(/\\/g, "/");
-    entry.background = norm.startsWith(root + "/") ? norm.slice(root.length + 1) : absPath;
-    saveManifest();
-  }
 
-  function getVideoBackgroundAbs(videoName) {
-    if (!activeProject) return null;
-    const entry = getVideoEntry(videoName);
-    return entry && entry.background ? toAbsolute(entry.background) : null;
-  }
 
   // Store the crop/preprocessing params on a video entry so each video keeps the
   // exact settings that generated its frames/<id>/ dir. This travels with the
@@ -308,17 +323,7 @@
     return entry && entry.labels ? toAbsolute(entry.labels) : null;
   }
 
-  function getFramesDir(videoName) {
-    if (!activeProject) return null;
-    const entry = getVideoEntry(videoName);
-    if (!entry) return null;
-    return activeProject.rootDir + "/" + entry.frames;
-  }
 
-  function getBackgroundsDir() {
-    if (!activeProject) return null;
-    return activeProject.rootDir + "/backgrounds";
-  }
 
   function getModelsDir() {
     if (!activeProject) return null;
@@ -441,6 +446,8 @@
     addVideoToManifest,
     removeVideoFromManifest,
     setVideoPath,
+    setVideoPose,
+    getVideoPose,
     getVideoEntry,
     getVideoIdFromName,
 
@@ -461,16 +468,13 @@
     updateModelPath,
 
     // Paths
-    getFramesDir,
-    getBackgroundsDir,
     getModelsDir,
     getCheckpointsDir,
     getExportsDir,
-    setVideoBackground,
-    getVideoBackgroundAbs,
     setVideoPreprocessing,
     getVideoPreprocessing,
     getVideoLabelsAbs,
+    getVideoFeaturesAbs,
 
     // .rlt file format
     exportRlt,

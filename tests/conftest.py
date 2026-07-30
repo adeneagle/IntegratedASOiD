@@ -1,17 +1,20 @@
 """
-Shared fixtures for the RealtimeASOID test suite.
+Shared fixtures for the A-SOID Desktop test suite.
 
-Provides synthetic video frames, label CSVs, fake checkpoints,
-and a FastAPI test client — all without requiring GPU or real video files.
+Provides synthetic pose files (DeepLabCut csv + SLEAP h5), sparse label CSVs in
+the exact format the labeling UI writes, a sample project on disk, and a FastAPI
+test client — all without requiring real data.
+
+The synthetic pose generator produces a genuinely learnable task (two behaviors
+that differ in how far the body parts spread from the centroid) so the
+active-learning tests can assert on real F1 movement rather than on mocks.
 """
 
 import json
 import os
 import sys
-import tempfile
-import shutil
 
-import cv2
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -22,204 +25,203 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 
-# ── Temporary directory fixtures ──────────────────────────────────────────
+BODYPARTS = ["nose", "leftear", "rightear", "tailbase"]
+FPS = 30
+
+
+# ── Synthetic pose generation ─────────────────────────────────────────────
+
+def make_behavior_series(n_frames: int, block: int = 150) -> np.ndarray:
+    """Alternating 0/1 behavior blocks — the ground truth to be recovered."""
+    return (np.arange(n_frames) // block) % 2
+
+
+def make_pose_array(n_frames: int, behavior: np.ndarray, seed: int = 0,
+                    noise: float = 1.5) -> np.ndarray:
+    """(n_frames, n_bodyparts*2) pose where behavior 1 spreads the parts wider.
+
+    The animal orbits the arena in both states, so the classifier can only
+    succeed on the inter-bodypart distances the feature extractor computes — not
+    on absolute position.
+    """
+    rng = np.random.RandomState(seed)
+    t = np.arange(n_frames)
+    cx = 300 + 60 * np.sin(t / 40.0)
+    cy = 300 + 60 * np.cos(t / 40.0)
+    spread = np.where(behavior == 1, 45.0, 14.0)
+
+    pose = np.zeros((n_frames, len(BODYPARTS) * 2))
+    for b in range(len(BODYPARTS)):
+        ang = b * (2 * np.pi / len(BODYPARTS))
+        pose[:, 2 * b] = cx + spread * np.cos(ang) + rng.randn(n_frames) * noise
+        pose[:, 2 * b + 1] = cy + spread * np.sin(ang) + rng.randn(n_frames) * noise
+    return pose
+
 
 @pytest.fixture
-def tmp_dir(tmp_path):
-    """Provide a temporary directory (pytest built-in)."""
-    return tmp_path
-
-
-# ── Synthetic frame fixtures ──────────────────────────────────────────────
-
-@pytest.fixture
-def synthetic_frames(tmp_path):
-    """
-    Create a flat directory of synthetic 64x64 RGB PNG frames: 0.png .. 19.png.
-    Returns the directory path.
-    """
-    frame_dir = tmp_path / "frames"
-    frame_dir.mkdir()
-    rng = np.random.RandomState(42)
-    for i in range(20):
-        img = rng.randint(0, 255, (64, 64, 3), dtype=np.uint8)
-        cv2.imwrite(str(frame_dir / f"{i}.png"), img)
-    return str(frame_dir)
+def behavior_series():
+    return make_behavior_series(3000)
 
 
 @pytest.fixture
-def synthetic_frames_subfolder(tmp_path):
+def pose_array(behavior_series):
+    return make_pose_array(3000, behavior_series)
+
+
+@pytest.fixture
+def dlc_csv(tmp_path, behavior_series):
+    """A single-animal DeepLabCut csv (3-level header: scorer/bodyparts/coords)."""
+    n = len(behavior_series)
+    pose = make_pose_array(n, behavior_series)
+    rng = np.random.RandomState(3)
+
+    cols, data = [], []
+    for b, bp in enumerate(BODYPARTS):
+        cols += [("scorer", bp, "x"), ("scorer", bp, "y"), ("scorer", bp, "likelihood")]
+        data += [pose[:, 2 * b], pose[:, 2 * b + 1],
+                 np.clip(0.98 - rng.rand(n) * 0.1, 0, 1)]
+
+    df = pd.DataFrame(
+        np.column_stack(data),
+        columns=pd.MultiIndex.from_tuples(cols, names=["scorer", "bodyparts", "coords"]),
+    )
+    path = tmp_path / "vid1_DLC.csv"
+    df.to_csv(path)
+    return str(path)
+
+
+@pytest.fixture
+def dlc_csv_lowconf(tmp_path, behavior_series):
+    """A DLC csv where one body part drops below threshold for a stretch.
+
+    Exercises adp_filt's hold-last-position behaviour.
     """
-    Create a subfolder-layout frame directory: frames/N/{0,1,2}.png for N in 2..19.
-    Returns the directory path.
-    """
-    frame_dir = tmp_path / "frames_sub"
-    frame_dir.mkdir()
-    rng = np.random.RandomState(42)
-    for n in range(2, 20):
-        sub = frame_dir / str(n)
-        sub.mkdir()
-        for j in range(3):
-            img = rng.randint(0, 255, (64, 64, 3), dtype=np.uint8)
-            cv2.imwrite(str(sub / f"{j}.png"), img)
-    return str(frame_dir)
+    n = len(behavior_series)
+    pose = make_pose_array(n, behavior_series, seed=11)
+
+    cols, data = [], []
+    for b, bp in enumerate(BODYPARTS):
+        llh = np.full(n, 0.95)
+        if bp == "nose":
+            llh[100:200] = 0.1  # tracking lost
+        cols += [("scorer", bp, "x"), ("scorer", bp, "y"), ("scorer", bp, "likelihood")]
+        data += [pose[:, 2 * b], pose[:, 2 * b + 1], llh]
+
+    df = pd.DataFrame(
+        np.column_stack(data),
+        columns=pd.MultiIndex.from_tuples(cols, names=["scorer", "bodyparts", "coords"]),
+    )
+    path = tmp_path / "vid_lowconf_DLC.csv"
+    df.to_csv(path)
+    return str(path)
+
+
+@pytest.fixture
+def sleap_h5(tmp_path, behavior_series):
+    """A SLEAP-style analysis .h5 (tracks + node_names), single track."""
+    n = len(behavior_series)
+    pose = make_pose_array(n, behavior_series, seed=5)
+    n_bp = len(BODYPARTS)
+
+    # SLEAP stores tracks as (n_tracks, n_coords, n_nodes, n_frames); the loader
+    # transposes it, so build the transpose of what it expects to read back.
+    tracks = np.zeros((1, 2, n_bp, n))
+    for b in range(n_bp):
+        tracks[0, 0, b, :] = pose[:, 2 * b]
+        tracks[0, 1, b, :] = pose[:, 2 * b + 1]
+
+    path = tmp_path / "vid1.analysis.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("tracks", data=tracks)
+        f.create_dataset("node_names",
+                         data=np.array(BODYPARTS, dtype=h5py.special_dtype(vlen=str)))
+    return str(path)
 
 
 # ── Label CSV fixtures ────────────────────────────────────────────────────
 
-@pytest.fixture
-def label_csv_3class(tmp_path, synthetic_frames):
+def write_sparse_labels(path, behavior, names=("rearing", "grooming")):
+    """Write labels exactly as `generateTrainingLabelCsv` does: SPARSE one-hot.
+
+    Rows exist only for in-bout frames. Half the behavior-0 blocks are left
+    unlabeled on purpose so the sparse->dense "other" fill is exercised.
     """
-    Create a 3-class one-hot label CSV matching frames 2..19.
-    Columns: time, walk, groom, rear
-    Returns the CSV path.
-    """
-    csv_path = tmp_path / "labels.csv"
-    rows = []
-    rng = np.random.RandomState(0)
-    for frame_num in range(2, 20):
-        label_idx = rng.randint(0, 3)
-        row = {"time": frame_num, "walk": 0, "groom": 0, "rear": 0}
-        cols = ["walk", "groom", "rear"]
-        row[cols[label_idx]] = 1
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    df.to_csv(str(csv_path), index=False)
-    return str(csv_path)
+    lines = ["time," + ",".join(names)]
+    for i, b in enumerate(behavior):
+        if b == 1:
+            lines.append(f"{i},1,0")
+        elif (i // 150) % 4 == 0:
+            lines.append(f"{i},0,1")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return list(names)
 
 
 @pytest.fixture
-def label_csv_2class(tmp_path):
-    """
-    Create a 2-class one-hot label CSV for frames 2..19.
-    Columns: time, active, inactive
-    """
-    csv_path = tmp_path / "labels_2class.csv"
-    rows = []
-    for frame_num in range(2, 20):
-        active = 1 if frame_num % 3 == 0 else 0
-        rows.append({"time": frame_num, "active": active, "inactive": 1 - active})
-    df = pd.DataFrame(rows)
-    df.to_csv(str(csv_path), index=False)
-    return str(csv_path)
-
-
-# ── Synthetic video fixture ──────────────────────────────────────────────
-
-@pytest.fixture
-def synthetic_video(tmp_path):
-    """
-    Create a short synthetic 64x64 .avi video (30 frames) with a bright blob.
-    Returns (video_path, num_frames).
-    """
-    video_path = str(tmp_path / "test_video.avi")
-    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-    fps = 30
-    size = (64, 64)
-    writer = cv2.VideoWriter(video_path, fourcc, fps, size)
-    rng = np.random.RandomState(7)
-
-    # Create a static-ish background with a moving blob
-    bg = rng.randint(180, 220, (64, 64, 3), dtype=np.uint8)
-    for i in range(30):
-        frame = bg.copy()
-        # Draw a dark circle (simulates the animal)
-        cx = 20 + i % 24
-        cy = 32
-        cv2.circle(frame, (cx, cy), 8, (30, 30, 30), -1)
-        writer.write(frame)
-    writer.release()
-    return video_path, 30
-
-
-@pytest.fixture
-def synthetic_background(tmp_path, synthetic_video):
-    """
-    Create a background image (grayscale) for the synthetic video.
-    Returns the background image path.
-    """
-    video_path, _ = synthetic_video
-    bg_path = str(tmp_path / "bg.png")
-    # Use a uniform gray as background (the average of frames without blob)
-    bg = np.full((64, 64), 200, dtype=np.uint8)
-    cv2.imwrite(bg_path, bg)
-    return bg_path
+def label_csv(tmp_path, behavior_series):
+    path = tmp_path / "vid1_bouts.csv"
+    write_sparse_labels(str(path), behavior_series)
+    return str(path)
 
 
 # ── Sample project fixture (for .rlt / project router tests) ──────────────
 
 @pytest.fixture
-def sample_project(tmp_path):
-    """
-    Build a realistic project directory on disk and return (project_dir, manifest).
+def sample_project(tmp_path, dlc_csv, behavior_series):
+    """A realistic project directory on disk. Returns (project_dir, manifest).
 
-    Includes the regenerable data (frames, backgrounds, a fake checkpoint) so
-    tests can assert that .rlt export deliberately *excludes* them.
+    Includes regenerable data (features, a model) so tests can assert that a
+    lightweight .rlt export deliberately *excludes* them.
     """
     proj = tmp_path / "sample_project"
-    for sub in ("labels", "frames", "backgrounds",
-                os.path.join("models", "checkpoints"),
-                os.path.join("models", "exports")):
+    for sub in ("labels", "pose", "predictions",
+                os.path.join("iteration-0", "features"),
+                os.path.join("models", "checkpoints")):
         os.makedirs(proj / sub, exist_ok=True)
 
     manifest = {
         "name": "sample_project",
         "created": "2026-01-01",
-        "version": 1,
+        "version": 2,
         "behaviors": [
-            {"name": "grooming", "key": "1"},
-            {"name": "walking", "key": "2"},
+            {"name": "rearing", "key": "1"},
+            {"name": "grooming", "key": "2"},
         ],
         "videos": [
             {
                 "id": "vid_a",
                 "path": "/abs/path/to/vid_a.mp4",
+                "pose": dlc_csv,
                 "labels": "labels/vid_a_bouts.csv",
-                "frames": "frames/vid_a/",
-                "background": "backgrounds/bg_vid_a.png",
+                "features": "iteration-0/features/vid_a.npz",
             },
             {
                 "id": "vid_b",
                 "path": "/abs/path/to/vid_b.mp4",
+                "pose": None,
                 "labels": "labels/vid_b_bouts.csv",
-                "frames": "frames/vid_b/",
-                "background": "backgrounds/bg_vid_b.png",
+                "features": "iteration-0/features/vid_b.npz",
             },
         ],
-        "preprocessing": {"box_size": 128, "difference_threshold": 10},
-        "training": {"variant": "b0", "max_epochs": 50},
-        "models": [
-            {
-                "name": "epoch=1.ckpt",
-                "path": "/abs/path/to/models/checkpoints/epoch=1.ckpt",
-                "created": "2026-01-02",
-                "val_loss": 0.123,
-                "config": {"variant": "b0", "binarize": None,
-                           "num_frames": 3, "tsm_stages": [5, 6, 7]},
-            }
-        ],
+        "preprocessing": {"bodyparts": BODYPARTS, "framerate": FPS, "llh_value": 0.6},
+        "training": {"init_ratio": 0.05, "max_iter": 10},
+        "models": [],
     }
     (proj / "project.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    # Label CSVs (the irreplaceable hand-annotation — should be packed)
-    (proj / "labels" / "vid_a_bouts.csv").write_text(
-        "start,end,behavior\n00:01.000,00:05.500,grooming\n", encoding="utf-8"
-    )
-    (proj / "labels" / "vid_b_bouts.csv").write_text(
-        "start,end,behavior\n00:02.000,00:03.000,walking\n", encoding="utf-8"
-    )
+    write_sparse_labels(str(proj / "labels" / "vid_a_bouts.csv"), behavior_series)
+    write_sparse_labels(str(proj / "labels" / "vid_b_bouts.csv"), behavior_series)
 
-    # Regenerable data (should NOT be packed)
-    rng = np.random.RandomState(1)
-    for vid in ("vid_a", "vid_b"):
-        fdir = proj / "frames" / vid
-        fdir.mkdir(exist_ok=True)
-        for i in range(3):
-            img = rng.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-            cv2.imwrite(str(fdir / f"{i}.png"), img)
-        bg = rng.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-        cv2.imwrite(str(proj / "backgrounds" / f"bg_{vid}.png"), bg)
-    (proj / "models" / "checkpoints" / "epoch=1.ckpt").write_bytes(b"\x00" * 1024)
+    # Regenerable data
+    np.savez_compressed(
+        proj / "iteration-0" / "features" / "vid_a.npz",
+        features=np.zeros((10, 16)), targets=np.zeros(10, dtype=int),
+        frames2integ=30, bin_width=3, n_frames=100, is_3d=False,
+        bodyparts=np.array(BODYPARTS, dtype=object),
+        class_names=np.array(["rearing", "grooming", "other"], dtype=object),
+    )
+    (proj / "models" / "checkpoints" / "rf_model.joblib").write_bytes(b"\x00" * 512)
+    (proj / "predictions" / "vid_a.json").write_text('{"frames": []}', encoding="utf-8")
 
     return str(proj), manifest
 
@@ -228,10 +230,7 @@ def sample_project(tmp_path):
 
 @pytest.fixture
 def client():
-    """
-    Provide an httpx AsyncClient for testing FastAPI endpoints.
-    Requires httpx to be installed.
-    """
+    """An httpx AsyncClient bound to the FastAPI app."""
     from httpx import AsyncClient, ASGITransport
     from backend.server import app
 
@@ -239,14 +238,27 @@ def client():
     return AsyncClient(transport=transport, base_url="http://test")
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+def wait_for(get_status, timeout=120.0, interval=0.05):
+    """Block until a task reaches a terminal state. Returns the final status."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = get_status()
+        if status in ("completed", "error", "cancelled"):
+            return status
+        time.sleep(interval)
+    raise AssertionError(f"task did not finish within {timeout}s (last: {get_status()})")
+
+
 # ── Cleanup task registries between tests ─────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def clear_task_registries():
-    """Clear all service task registries before each test."""
+    """Clear all service task registries after each test."""
     yield
-    # Cleanup after test
-    from backend.services import preprocess_service, training_service, inference_service
-    preprocess_service._tasks.clear()
+    from backend.services import pose_service, training_service, inference_service
+    pose_service._tasks.clear()
     training_service._tasks.clear()
     inference_service._tasks.clear()

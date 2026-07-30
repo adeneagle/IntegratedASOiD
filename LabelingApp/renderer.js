@@ -1822,9 +1822,8 @@ const switchToVideo = (videoName) => {
 
   localStorage.setItem("lastActiveVideo", videoName);
   renderVideoSidebar();
-  // Load this video's saved background + crop params into the preprocess panel.
-  applyVideoBackground(videoName);
-  applyVideoCropParams(videoName);
+  // Point the Pose panel (and the skeleton overlay) at this video's pose file.
+  try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
 };
 
 const nextBehaviorKey = () => {
@@ -1894,6 +1893,7 @@ const loadHtml5File = (file) => {
   resetSession();
   restoreProgress(file.name);
   restorePredictions(file.name);
+  try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
   setStatus(`Loaded ${file.name}`);
 };
 
@@ -2017,6 +2017,7 @@ const loadWebcodecsFile = async (file) => {
     webcodecsOperationInProgress = false;
     restoreProgress(file.name);
     restorePredictions(file.name);
+    try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
     video.removeAttribute("src");
     video.load();
   }
@@ -2550,9 +2551,14 @@ const exportOneHot = async () => {
   }
 };
 
-const generateLabeledVideo = async () => {
-  if (bouts.length === 0) {
-    setStatus("No bouts to overlay.");
+// Burn behavior labels into a copy of the video with ffmpeg drawtext.
+// `segments` defaults to the hand-labeled bouts; the Active Learning tab passes
+// model predictions instead (A-SOID's `create_labeled_vid`), which is the same
+// rendering job over a different source of intervals.
+const generateLabeledVideo = async (segments = null) => {
+  const source = segments || bouts;
+  if (source.length === 0) {
+    setStatus(segments ? "No predictions to overlay." : "No bouts to overlay.");
     return;
   }
 
@@ -2572,7 +2578,7 @@ const generateLabeledVideo = async () => {
     : "video";
 
   const saveResult = await window.api.saveVideoDialog({
-    defaultPath: `${baseName}-labeled.mp4`
+    defaultPath: `${baseName}-${segments ? "predicted" : "labeled"}.mp4`
   });
 
   if (saveResult.canceled || !saveResult.filePath) {
@@ -2583,8 +2589,8 @@ const generateLabeledVideo = async () => {
   const outputPath = saveResult.filePath;
   const fps = parseFloat(fpsInput.value) || 30;
 
-  // Build ffmpeg drawtext filters for each bout
-  const filters = bouts.map((bout) => {
+  // Build ffmpeg drawtext filters for each interval
+  const filters = source.map((bout) => {
     const startSec = (bout.startFrame * frameDurationMs) / 1000;
     const endSec = (bout.endFrame * frameDurationMs) / 1000;
     const escaped = bout.behaviorName.replace(/'/g, "'\\''").replace(/:/g, "\\:");
@@ -3130,7 +3136,7 @@ document.addEventListener("fullscreenchange", () => {
 exportCsvButton.addEventListener("click", exportCsv);
 importCsvButton.addEventListener("click", importCsv);
 exportOneHotButton.addEventListener("click", exportOneHot);
-generateLabeledVideoButton.addEventListener("click", generateLabeledVideo);
+generateLabeledVideoButton.addEventListener("click", () => generateLabeledVideo());
 
 renderBehaviors();
 renderBouts();
@@ -3234,634 +3240,711 @@ document.querySelectorAll(".tab-bar .tab").forEach((btn) => {
     document.body.dataset.tab = tabName;
     updateContentLayout();
     if (tabName === "train") renderTrainVideoChecklist();
+    if (tabName === "pose") renderPoseVideoChecklist();
   });
 });
 
-// ── Preprocessing Panel ───────────────────────────────────────────────────
-
-const ppState = {
-  bgPath: null,
-  taskId: null,
-  sseSource: null,
-  bgByVideo: {}, // videoName -> background image path (auto-loaded on switch)
-  cropByVideo: {}, // videoName -> crop/preprocess params (auto-loaded on switch)
-  frameW: null,  // original source frame size (from last preview)
-  frameH: null,
-  previewFrame: null,   // frame index currently shown in the preview
-  previewCenter: null,  // smoothed crop center [cx,cy] (small space), chained on step
-};
-
-// Remember a background for a video (persisted in settings; also recorded on the
-// project manifest when a project is open).
-function rememberVideoBackground(videoName, absPath) {
-  if (!videoName || !absPath) return;
-  ppState.bgByVideo[videoName] = absPath;
-  try { saveSettings(); } catch { /* settings not ready */ }
-  if (window.projectManager && window.projectManager.isActive()) {
-    try { window.projectManager.setVideoBackground(videoName, absPath); } catch { /* ignore */ }
-  }
-}
-
-function resolveVideoBackground(videoName) {
-  if (!videoName) return null;
-  if (window.projectManager && window.projectManager.isActive()) {
-    const p = window.projectManager.getVideoBackgroundAbs(videoName);
-    if (p) return p;
-  }
-  return ppState.bgByVideo[videoName] || null;
-}
-
-// Remember the crop/preprocess params that generated a video's frames. Saved in
-// settings (survives restarts) and on the project manifest (travels with the
-// project/.rlt), mirroring rememberVideoBackground.
-function rememberVideoCropParams(videoName, params) {
-  if (!videoName || !params) return;
-  ppState.cropByVideo[videoName] = params;
-  try { saveSettings(); } catch { /* settings not ready */ }
-  if (window.projectManager && window.projectManager.isActive()) {
-    try { window.projectManager.setVideoPreprocessing(videoName, params); } catch { /* ignore */ }
-  }
-}
-
-function resolveVideoCropParams(videoName) {
-  if (!videoName) return null;
-  if (window.projectManager && window.projectManager.isActive()) {
-    const p = window.projectManager.getVideoPreprocessing(videoName);
-    if (p) return p;
-  }
-  return ppState.cropByVideo[videoName] || null;
-}
-
-// Load a video's saved crop params into the preprocess panel (if any exist).
-function applyVideoCropParams(videoName) {
-  const p = resolveVideoCropParams(videoName);
-  if (p) applyCropParams(p);
-}
-
-// Load the background that belongs to a video (if any) into the preprocess panel.
-async function applyVideoBackground(videoName) {
-  const p = resolveVideoBackground(videoName);
-  if (p && await fileExists(p)) {
-    ppState.bgPath = p;
-    setPathDisplay("ppBgPath", p);
-  } else {
-    ppState.bgPath = null;
-    const el = document.getElementById("ppBgPath");
-    if (el) el.textContent = "No background";
-  }
-}
-
-// Slider value displays
-["ppBoxSize", "ppDiffThresh", "ppDownsample", "ppOpen1", "ppClose", "ppOpen2", "ppSmoothing", "ppDeadband", "ppMinArea"].forEach((id) => {
-  const slider = document.getElementById(id);
-  const output = document.getElementById(id + "Val");
-  if (slider && output) {
-    slider.addEventListener("input", () => { output.textContent = slider.value; });
-  }
-});
-
-// Resize slider shows a percent and live-updates the processed-size readout.
-(() => {
-  const slider = document.getElementById("ppResize");
-  const output = document.getElementById("ppResizeVal");
-  if (!slider) return;
-  slider.addEventListener("input", () => {
-    if (output) output.textContent = `${slider.value}%`;
-    updateResizedSizeDisplay();
-  });
-})();
-
-function getCropParams() {
-  return {
-    box_size: parseInt(document.getElementById("ppBoxSize").value),
-    difference_threshold: parseInt(document.getElementById("ppDiffThresh").value),
-    difference_mode: document.getElementById("ppDiffMode").value,
-    downsample_factor: parseInt(document.getElementById("ppDownsample").value),
-    open1_kernel: parseInt(document.getElementById("ppOpen1").value),
-    close_kernel: parseInt(document.getElementById("ppClose").value),
-    open2_kernel: parseInt(document.getElementById("ppOpen2").value),
-    resize_factor: (parseInt(document.getElementById("ppResize").value) || 100) / 100,
-    smoothing: parseFloat(document.getElementById("ppSmoothing").value),
-    deadband: parseFloat(document.getElementById("ppDeadband").value),
-    min_contour_area: parseFloat(document.getElementById("ppMinArea").value),
-  };
-}
-
-// Inverse of getCropParams: push a saved params object into the panel controls
-// (and refresh their value labels). Missing fields are left at their current
-// values so older/partial records don't wipe the panel.
-function applyCropParams(p) {
-  if (!p) return;
-  const setSlider = (id, valId, val) => {
-    const el = document.getElementById(id);
-    const out = document.getElementById(valId);
-    if (el && val !== undefined && val !== null) { el.value = val; if (out) out.textContent = val; }
-  };
-  setSlider("ppBoxSize", "ppBoxSizeVal", p.box_size);
-  setSlider("ppDiffThresh", "ppDiffThreshVal", p.difference_threshold);
-  if (p.difference_mode) document.getElementById("ppDiffMode").value = p.difference_mode;
-  setSlider("ppDownsample", "ppDownsampleVal", p.downsample_factor);
-  setSlider("ppOpen1", "ppOpen1Val", p.open1_kernel);
-  setSlider("ppClose", "ppCloseVal", p.close_kernel);
-  setSlider("ppOpen2", "ppOpen2Val", p.open2_kernel);
-  if (p.smoothing !== undefined) setSlider("ppSmoothing", "ppSmoothingVal", p.smoothing);
-  if (p.deadband !== undefined) setSlider("ppDeadband", "ppDeadbandVal", p.deadband);
-  if (p.min_contour_area !== undefined) setSlider("ppMinArea", "ppMinAreaVal", p.min_contour_area);
-  if (p.resize_factor) {
-    const pct = Math.round(p.resize_factor * 100);
-    const el = document.getElementById("ppResize");
-    const out = document.getElementById("ppResizeVal");
-    if (el) el.value = pct;
-    if (out) out.textContent = `${pct}%`;
-  }
-  updateResizedSizeDisplay();
-}
-
-// Update the "Processed" size readout from the stored original frame size and
-// the current resize slider (so it reacts live without re-running a preview).
-function updateResizedSizeDisplay() {
-  const el = document.getElementById("ppResizedSize");
-  if (!el) return;
-  const factor = (parseInt(document.getElementById("ppResize").value) || 100) / 100;
-  if (ppState.frameW && ppState.frameH) {
-    el.textContent = `${Math.round(ppState.frameW * factor)} × ${Math.round(ppState.frameH * factor)}`;
-  } else {
-    el.textContent = "—";
-  }
-}
+// ── Pose Panel ────────────────────────────────────────────────────────────
+// Replaces the TSM app's Preprocess panel. Where that one computed a
+// background, tuned a crop and dumped PNG frames, this one just points at a
+// pose file and picks which body parts feed the feature extractor.
 
 function getVideoPath() {
   return currentFile && currentFile.path ? currentFile.path : null;
 }
 
-// Compute background
-document.getElementById("ppComputeBg").addEventListener("click", async () => {
-  const videoPath = getVideoPath();
-  if (!videoPath) { alert("Load a video first."); return; }
-  const numFrames = parseInt(document.getElementById("ppBgNumFrames").value) || 500;
-  document.getElementById("ppBgPath").textContent = "Computing...";
-  const body = { video_path: videoPath, num_frames: numFrames };
-  // When a project is open, write the background into the project's backgrounds/ dir.
-  if (window.projectManager && window.projectManager.isActive()) {
-    body.output_dir = window.projectManager.getBackgroundsDir();
-  }
-  try {
-    const res = await backendFetch("/api/preprocess/background", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    ppState.bgPath = res.path;
-    setPathDisplay("ppBgPath", res.path);
-    rememberVideoBackground(currentVideoName, res.path);
-  } catch (e) {
-    document.getElementById("ppBgPath").textContent = `Error: ${e.message}`;
-  }
-});
+const poseState = {
+  origin: "deeplabcut",
+  multiAnimal: false,
+  bodyparts: [],            // available in the attached pose file
+  selected: new Set(),      // body part names to extract features from
+  animals: [],
+  selectedAnimals: new Set(),
+  poseByVideo: {},          // videoName -> pose path (mirrors the manifest)
+  nFrames: 0,
+  is3d: false,
+  taskId: null,
+  sseSource: null,
+  extractedVideos: new Set(), // videoNames with features on disk this session
+  // Overlay
+  keypoints: null,          // { bodyparts, points: [{name,x[],y[],likelihood[]}] }
+  keypointsVideo: null,     // which video `keypoints` belongs to
+};
 
-// Select background image
-document.getElementById("ppSelectBg").addEventListener("click", async () => {
-  if (!window.api) return;
-  const res = await window.api.selectFile({
-    title: "Select Background Image",
-    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "bmp"] }],
-  });
-  if (!res.canceled) {
-    ppState.bgPath = res.path;
-    setPathDisplay("ppBgPath", res.path);
-    rememberVideoBackground(currentVideoName, res.path);
-  }
-});
+const poseEl = (id) => document.getElementById(id);
 
-// Preview a specific frame. When `chain` is true, the smoothed center from the
-// last previewed frame is carried in so stepping forward shows the temporal
-// smoothing settle (a single preview otherwise has no history).
-async function runPreview(frameIndex, { chain = false } = {}) {
-  const videoPath = getVideoPath();
-  if (!videoPath) { alert("Load a video first."); return; }
-  if (!ppState.bgPath) { alert("Compute or select a background first."); return; }
-  frameIndex = Math.max(0, Math.round(frameIndex));
-
-  try {
-    const res = await backendFetch("/api/preprocess/preview", {
-      method: "POST",
-      body: JSON.stringify({
-        video_path: videoPath,
-        bg_path: ppState.bgPath,
-        frame_index: frameIndex,
-        crop_params: getCropParams(),
-        prev_center: chain ? ppState.previewCenter : null,
-      }),
-    });
-
-    ppState.previewFrame = frameIndex;
-    ppState.previewCenter = res.center || null;
-    const frameOut = document.getElementById("ppPreviewFrame");
-    if (frameOut) frameOut.textContent = frameIndex;
-    // Keep the main player in sync so you see the frame in context.
-    try { if (typeof seekToFrame === "function") seekToFrame(frameIndex); } catch { /* ignore */ }
-
-    // Update the frame-size readouts from the original (source) dims.
-    if (res.frame_width && res.frame_height) {
-      ppState.frameW = res.frame_width;
-      ppState.frameH = res.frame_height;
-      document.getElementById("ppFrameSize").textContent =
-        `${res.frame_width} × ${res.frame_height}`;
-    }
-    if (res.resized_width && res.resized_height) {
-      document.getElementById("ppResizedSize").textContent =
-        `${res.resized_width} × ${res.resized_height}`;
-    } else {
-      updateResizedSizeDisplay();
-    }
-
-    // Draw base64 images to canvases
-    const pairs = [
-      ["ppPreviewBbox", res.original_bbox],
-      ["ppPreviewMask", res.mask],
-      ["ppPreviewCrop", res.cropped],
-    ];
-    for (const [canvasId, b64] of pairs) {
-      const canvas = document.getElementById(canvasId);
-      const ctx = canvas.getContext("2d");
-      const img = new Image();
-      img.onload = () => {
-        canvas.width = img.width;
-        canvas.height = img.height;
-        ctx.drawImage(img, 0, 0);
-      };
-      img.src = `data:image/jpeg;base64,${b64}`;
-    }
-  } catch (e) {
-    alert(`Preview failed: ${e.message}`);
-  }
-}
-
-// "Preview Current Frame" — resets the smoothing chain at the player's frame.
-document.getElementById("ppPreview").addEventListener("click", () => {
-  ppState.previewCenter = null;
-  runPreview(currentFrameIndex, { chain: false });
-});
-
-// Step forward (chains the smoothed center so you watch the box settle) / back.
-document.getElementById("ppNextFrame").addEventListener("click", () => {
-  const base = ppState.previewFrame != null ? ppState.previewFrame : currentFrameIndex;
-  runPreview(base + 1, { chain: true });
-});
-document.getElementById("ppPrevFrame").addEventListener("click", () => {
-  const base = ppState.previewFrame != null ? ppState.previewFrame : currentFrameIndex;
-  ppState.previewCenter = null; // stepping back breaks the forward chain
-  runPreview(base - 1, { chain: false });
-});
-
-// Run preprocessing — frames always go into the active project's frames/<id>/.
-// Merge the current video's bouts into inclusive [start, end] native-index
-// ranges, each extended by `leadIn` frames so the clip context exists on disk.
-function computeLabeledFrameRanges(boutList, leadIn) {
-  if (!Array.isArray(boutList) || boutList.length === 0) return [];
-  const raw = boutList
-    .filter((b) => Number.isFinite(b.startFrame) && Number.isFinite(b.endFrame))
-    .map((b) => [
-      Math.max(0, Math.min(b.startFrame, b.endFrame) - leadIn),
-      Math.max(b.startFrame, b.endFrame),
-    ])
-    .sort((a, b) => a[0] - b[0]);
-  const merged = [];
-  for (const [s, e] of raw) {
-    const last = merged[merged.length - 1];
-    if (last && s <= last[1] + 1) last[1] = Math.max(last[1], e);
-    else merged.push([s, e]);
-  }
-  return merged;
-}
-
-document.getElementById("ppRun").addEventListener("click", async () => {
-  const videoPath = getVideoPath();
-  if (!videoPath) { alert("Load a video first."); return; }
-
+function getPosePathFor(videoName) {
   const pm = window.projectManager;
-  if (!pm || !pm.isActive()) { alert("Open a project first."); return; }
-  const outputDir = pm.getProjectRoot() + "/frames";
-  const outputName = pm.getVideoIdFromName(currentVideoName);
+  if (pm && pm.isActive()) {
+    const p = pm.getVideoPose(videoName);
+    if (p) return p;
+  }
+  return poseState.poseByVideo[videoName] || null;
+}
 
-  // Only labeled regions are extracted (training needs nothing else; AL reads
-  // the video on the fly). Extend each bout by frames_per_group-1 for clip context.
-  const leadIn = (parseInt(document.getElementById("trainFramesPerGroup").value, 10) || 3) - 1;
-  const frameRanges = computeLabeledFrameRanges(bouts, leadIn);
-  if (frameRanges.length === 0) {
-    alert("No labeled bouts for this video — label some frames first (only labeled frames are extracted).");
+function setPosePathFor(videoName, posePath) {
+  poseState.poseByVideo[videoName] = posePath;
+  const pm = window.projectManager;
+  if (pm && pm.isActive()) {
+    try { pm.setVideoPose(videoName, posePath); } catch { /* not tracked yet */ }
+  }
+}
+
+// nchoose2(n) * 2 + n — mirrors asoid_core.features.feature_width, so the UI can
+// warn about the quadratic growth before the user commits to 30 body parts.
+function poseFeatureWidth(n) {
+  if (n < 2) return 0;
+  return (n * (n - 1) / 2) * 2 + n;
+}
+
+function updatePoseDerivedDisplays() {
+  const n = poseState.selected.size;
+  const widthEl = poseEl("poseFeatureWidth");
+  if (widthEl) {
+    widthEl.textContent = n < 2
+      ? "select at least 2"
+      : `${n} parts → ${poseFeatureWidth(n)} features`;
+  }
+
+  const fps = parseFloat(poseEl("poseFramerate").value) || 30;
+  const minDur = parseFloat(poseEl("poseMinDuration").value) || 0.1;
+  // frames2integ = round(framerate * min_duration / 0.1); bin = frames2integ / 10
+  const frames2integ = Math.round(fps * (minDur / 0.1));
+  const binWidth = Math.max(1, Math.floor(frames2integ / 10));
+  poseEl("poseBinWidth").textContent = binWidth;
+  poseEl("poseBinMs").textContent = `(${Math.round((binWidth / fps) * 1000)} ms)`;
+}
+
+function renderPoseBodypartList() {
+  const container = poseEl("poseBodypartList");
+  if (!container) return;
+  container.innerHTML = "";
+
+  if (poseState.bodyparts.length === 0) {
+    container.innerHTML = '<p class="muted">Attach a pose file to list its body parts.</p>';
+    updatePoseDerivedDisplays();
     return;
   }
 
-  document.getElementById("ppRun").disabled = true;
-  document.getElementById("ppStop").disabled = false;
-  document.getElementById("ppStatus").textContent = "Starting...";
+  for (const bp of poseState.bodyparts) {
+    const row = document.createElement("label");
+    row.className = "checkbox-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = poseState.selected.has(bp);
+    cb.addEventListener("change", () => {
+      if (cb.checked) poseState.selected.add(bp);
+      else poseState.selected.delete(bp);
+      updatePoseDerivedDisplays();
+      invalidatePoseOverlay();
+    });
+    const span = document.createElement("span");
+    span.textContent = bp;
+    row.append(cb, span);
+    container.appendChild(row);
+  }
+  updatePoseDerivedDisplays();
+}
 
-  // These are the params that produce this video's frames — record them against
-  // the video so switching back restores them and re-runs stay consistent.
-  const cropParams = getCropParams();
-  rememberVideoCropParams(currentVideoName, cropParams);
+function renderPoseAnimalList() {
+  const container = poseEl("poseAnimalList");
+  const hint = poseEl("poseAnimalHint");
+  if (!container) return;
+  container.innerHTML = "";
+
+  if (!poseState.multiAnimal || poseState.animals.length === 0) {
+    if (hint) hint.style.display = "";
+    return;
+  }
+  if (hint) hint.style.display = "none";
+
+  for (const an of poseState.animals) {
+    const row = document.createElement("label");
+    row.className = "checkbox-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = poseState.selectedAnimals.has(an);
+    cb.addEventListener("change", () => {
+      if (cb.checked) poseState.selectedAnimals.add(an);
+      else poseState.selectedAnimals.delete(an);
+      invalidatePoseOverlay();
+    });
+    const span = document.createElement("span");
+    span.textContent = an;
+    row.append(cb, span);
+    container.appendChild(row);
+  }
+}
+
+// Ask the backend what's in a pose file and repopulate the pickers.
+async function inspectPoseFile(posePath) {
+  const info = await backendFetch("/api/pose/inspect", {
+    method: "POST",
+    body: JSON.stringify({
+      pose_path: posePath,
+      origin: poseState.origin,
+      multi_animal: poseState.multiAnimal,
+    }),
+  });
+
+  poseState.bodyparts = info.bodyparts || [];
+  poseState.animals = info.animals || [];
+  poseState.nFrames = info.n_frames || 0;
+  poseState.is3d = !!info.is_3d;
+
+  // Default to everything selected — deselecting is the rare, deliberate act.
+  poseState.selected = new Set(poseState.bodyparts);
+  poseState.selectedAnimals = new Set(poseState.animals);
+
+  poseEl("poseInfo").textContent =
+    `${info.n_frames} frames · ${poseState.bodyparts.length} body parts` +
+    (poseState.animals.length ? ` · ${poseState.animals.length} animals` : "") +
+    (info.is_3d ? " · 3D" : "") +
+    (info.has_likelihood ? "" : " · no likelihood column");
+
+  renderPoseAnimalList();
+  renderPoseBodypartList();
+  return info;
+}
+
+poseEl("poseOrigin").addEventListener("change", async () => {
+  poseState.origin = poseEl("poseOrigin").value;
+  // OpenMonkeyStudio is single-animal 3D by definition.
+  if (poseState.origin === "openmonkeystudio") {
+    poseState.multiAnimal = false;
+    poseEl("poseMultiAnimal").checked = false;
+  }
+  const p = getPosePathFor(currentVideoName);
+  if (p) { try { await inspectPoseFile(p); } catch (e) { setStatus(e.message); } }
+});
+
+poseEl("poseMultiAnimal").addEventListener("change", async () => {
+  poseState.multiAnimal = poseEl("poseMultiAnimal").checked;
+  const p = getPosePathFor(currentVideoName);
+  if (p) { try { await inspectPoseFile(p); } catch (e) { setStatus(e.message); } }
+});
+
+poseEl("poseAttach").addEventListener("click", async () => {
+  if (!window.api) return;
+  if (!currentVideoName) { alert("Load a video first — the pose file attaches to it."); return; }
+  const res = await window.api.selectFile({
+    title: "Select Pose File",
+    filters: [
+      { name: "Pose files", extensions: ["csv", "h5", "mat", "txt"] },
+      { name: "All Files", extensions: ["*"] },
+    ],
+  });
+  if (res.canceled) return;
+
+  setPosePathFor(currentVideoName, res.path);
+  setPathDisplay("posePath", res.path);
+  try {
+    await inspectPoseFile(res.path);
+    invalidatePoseOverlay();
+    setStatus(`Pose attached to ${currentVideoName}`);
+  } catch (e) {
+    poseEl("poseInfo").textContent = `Could not read that pose file: ${e.message}`;
+  }
+  renderPoseVideoChecklist();
+  renderTrainVideoChecklist();
+});
+
+poseEl("poseSelectAllBp").addEventListener("click", () => {
+  poseState.selected = new Set(poseState.bodyparts);
+  renderPoseBodypartList();
+  invalidatePoseOverlay();
+});
+poseEl("poseSelectNoneBp").addEventListener("click", () => {
+  poseState.selected.clear();
+  renderPoseBodypartList();
+  invalidatePoseOverlay();
+});
+poseEl("poseFramerate").addEventListener("input", updatePoseDerivedDisplays);
+poseEl("poseMinDuration").addEventListener("input", updatePoseDerivedDisplays);
+
+// Videos eligible for extraction: those with a pose file attached.
+function renderPoseVideoChecklist() {
+  const container = poseEl("poseVideoChecklist");
+  if (!container) return;
+  container.innerHTML = "";
+
+  const names = videoList.map((v) => v.name);
+  if (names.length === 0) {
+    container.innerHTML = '<p class="muted">No videos in this project.</p>';
+    return;
+  }
+
+  for (const name of names) {
+    const pose = getPosePathFor(name);
+    const row = document.createElement("label");
+    row.className = "checkbox-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!pose;
+    cb.disabled = !pose;
+    cb.dataset.video = name;
+    const span = document.createElement("span");
+    span.textContent = pose ? name : `${name} (no pose file)`;
+    if (!pose) span.className = "muted";
+    row.append(cb, span);
+    container.appendChild(row);
+  }
+}
+
+function selectedPoseVideos() {
+  const container = poseEl("poseVideoChecklist");
+  if (!container) return [];
+  return [...container.querySelectorAll("input[type=checkbox]")]
+    .filter((cb) => cb.checked && !cb.disabled)
+    .map((cb) => cb.dataset.video);
+}
+
+function poseLog(line) {
+  const el = poseEl("poseLog");
+  if (!el) return;
+  el.style.display = "block";
+  el.textContent += line + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+poseEl("poseExtract").addEventListener("click", async () => {
+  const pm = window.projectManager;
+  if (!pm || !pm.isActive()) { alert("Open a project first."); return; }
+  if (poseState.selected.size < 2) {
+    alert("Select at least two body parts — features are built from body-part pairs.");
+    return;
+  }
+
+  const names = selectedPoseVideos();
+  if (names.length === 0) { alert("No videos with an attached pose file are selected."); return; }
+
+  // Labels must be on disk before the backend reads them.
+  try { await saveProgress(); await pm.flushManifest(); } catch { /* best effort */ }
+
+  const videos = names.map((name) => ({
+    id: pm.getVideoIdFromName(name),
+    pose_path: getPosePathFor(name),
+    label_path: pm.getVideoLabelsAbs(name),
+  }));
+
+  poseEl("poseLog").textContent = "";
+  poseEl("poseExtract").disabled = true;
+  poseEl("poseStopExtract").disabled = false;
+  poseEl("poseStatus").textContent = "Starting...";
+
+  const params = {
+    project_dir: pm.getProjectRoot(),
+    videos,
+    origin: poseState.origin,
+    bodyparts: [...poseState.selected],
+    framerate: parseFloat(poseEl("poseFramerate").value) || 30,
+    min_duration: parseFloat(poseEl("poseMinDuration").value) || 0.1,
+    llh_value: parseFloat(poseEl("poseLlh").value) || 0.6,
+    animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
+    multi_animal: poseState.multiAnimal,
+    iteration_dir: currentIterationDir(),
+  };
+
+  // Persist the settings that produced these features, so reopening the project
+  // (or handing it to someone else) reproduces the exact feature space.
+  try {
+    pm.updatePreprocessingConfig({
+      origin: params.origin,
+      bodyparts: params.bodyparts,
+      framerate: params.framerate,
+      min_duration: params.min_duration,
+      llh_value: params.llh_value,
+      multi_animal: params.multi_animal,
+      animals: params.animals,
+    });
+  } catch { /* manifest not ready */ }
 
   try {
-    const res = await backendFetch("/api/preprocess/run", {
+    const res = await backendFetch("/api/pose/extract-features", {
       method: "POST",
-      body: JSON.stringify({
-        video_path: videoPath,
-        output_dir: outputDir,
-        crop_params: cropParams,
-        frame_ranges: frameRanges,
-        bg_path: ppState.bgPath,
-        output_name: outputName,
-      }),
+      body: JSON.stringify(params),
     });
-    ppState.taskId = res.task_id;
+    poseState.taskId = res.task_id;
 
-    // Subscribe to SSE
-    ppState.sseSource = backendSSE(
-      `/api/preprocess/status/${res.task_id}`,
-      (data) => {
+    poseState.sseSource = backendSSE(
+      `/api/pose/status/${res.task_id}`,
+      async (data) => {
         const pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
-        document.getElementById("ppProgress").value = pct;
-        document.getElementById("ppStatus").textContent = `${data.status}: ${data.progress}/${data.total}`;
-        if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
-          ppState.sseSource?.close();
-          document.getElementById("ppRun").disabled = false;
-          document.getElementById("ppStop").disabled = true;
-          if (data.status === "error") {
-            document.getElementById("ppStatus").textContent = `Error: ${data.error}`;
-          } else if (data.output_dir) {
-            document.getElementById("ppStatus").textContent = `Done: ${data.output_dir}`;
-            // Newly-created frames may make this video trainable — refresh the list.
+        poseEl("poseProgress").value = pct;
+        poseEl("poseStatus").textContent = `${data.status}: ${data.progress}/${data.total}`;
+
+        if (data.status === "completed") {
+          poseState.sseSource?.close();
+          poseEl("poseExtract").disabled = false;
+          poseEl("poseStopExtract").disabled = true;
+          try {
+            const results = await backendFetch(`/api/pose/results/${poseState.taskId}`);
+            poseLog(`Classes: ${results.class_names.join(", ")}`);
+            poseLog(`Bin width: ${results.bin_width} frames (frames2integ ${results.frames2integ})`);
+            for (const v of results.videos) {
+              poseState.extractedVideos.add(v.id);
+              const counts = Object.entries(v.class_counts)
+                .map(([k, n]) => `${k}=${n}`).join(" ");
+              poseLog(`${v.id}: ${v.n_rows} rows x ${v.n_features} features | ${counts}`);
+              if (v.mean_rejected_fraction > 0.2) {
+                poseLog(`  warning: ${(v.mean_rejected_fraction * 100).toFixed(0)}% of points ` +
+                        `were below the likelihood threshold — check tracking quality.`);
+              }
+            }
+            poseEl("poseStatus").textContent = `Done: ${results.videos.length} video(s)`;
             renderTrainVideoChecklist();
+          } catch (e) {
+            poseEl("poseStatus").textContent = `Error fetching results: ${e.message}`;
+          }
+        } else if (data.status === "error" || data.status === "cancelled") {
+          poseState.sseSource?.close();
+          poseEl("poseExtract").disabled = false;
+          poseEl("poseStopExtract").disabled = true;
+          if (data.error) {
+            poseEl("poseStatus").textContent = `Error: ${data.error}`;
+            poseLog(data.error);
           }
         }
       },
       () => {
-        document.getElementById("ppRun").disabled = false;
-        document.getElementById("ppStop").disabled = true;
+        poseEl("poseExtract").disabled = false;
+        poseEl("poseStopExtract").disabled = true;
       }
     );
   } catch (e) {
-    document.getElementById("ppStatus").textContent = `Error: ${e.message}`;
-    document.getElementById("ppRun").disabled = false;
-    document.getElementById("ppStop").disabled = true;
+    poseEl("poseStatus").textContent = `Error: ${e.message}`;
+    poseEl("poseExtract").disabled = false;
+    poseEl("poseStopExtract").disabled = true;
   }
 });
 
-// Stop preprocessing
-document.getElementById("ppStop").addEventListener("click", async () => {
-  if (ppState.taskId) {
-    try {
-      await backendFetch(`/api/preprocess/stop/${ppState.taskId}`, { method: "POST" });
-    } catch { /* ignore */ }
-  }
+poseEl("poseStopExtract").addEventListener("click", async () => {
+  if (!poseState.taskId) return;
+  try { await backendFetch(`/api/pose/stop/${poseState.taskId}`, { method: "POST" }); }
+  catch { /* already finished */ }
 });
+
+// ── Iterations (A-SOID's E_create_new_training) ───────────────────────────
+// A-SOID's human-in-the-loop cycle is: train -> find low-confidence frames ->
+// relabel them -> retrain on the improved labels, keeping each round's data
+// under iteration-N/. Here the relabeling already happens live in the Active
+// Learning tab and labels are auto-saved, so "new iteration" is just: bump the
+// directory, re-extract from the current labels, retrain.
+
+function currentIterationDir() {
+  const n = parseInt(poseEl("poseIteration").value, 10);
+  return `iteration-${Number.isFinite(n) && n >= 0 ? n : 0}`;
+}
+
+poseEl("poseNewIteration").addEventListener("click", async () => {
+  const pm = window.projectManager;
+  if (!pm || !pm.isActive()) { alert("Open a project first."); return; }
+
+  const next = (parseInt(poseEl("poseIteration").value, 10) || 0) + 1;
+  poseEl("poseIteration").value = next;
+  // Features from the previous round don't carry over — the whole point is to
+  // rebuild them from the labels as they stand now.
+  poseState.extractedVideos.clear();
+  renderTrainVideoChecklist();
+  poseLog(`--- iteration ${next}: re-extract features from the current labels, then train ---`);
+  setStatus(`Iteration ${next}. Run Extract Features to rebuild from your refined labels.`);
+});
+
+poseEl("poseIteration").addEventListener("change", () => {
+  poseState.extractedVideos.clear();
+  renderTrainVideoChecklist();
+});
+
+// ── Pose skeleton overlay ─────────────────────────────────────────────────
+// Drawn on its own canvas above the player so it works in both playback modes
+// (the WebCodecs path owns #videoCanvas; the plain <video> path leaves it
+// hidden). Points are drawn in the pose file's own pixel coordinates and the
+// canvas is sized to the video's natural resolution, so the browser's
+// object-fit: contain scaling lines them up with the frame for free.
+//
+// Deliberately shows RAW, unfiltered keypoints: the whole point is to reveal
+// where tracking failed, which the hold-last-position filter would hide.
+
+const poseCanvas = document.getElementById("poseCanvas");
+const poseCtx = poseCanvas ? poseCanvas.getContext("2d") : null;
+let poseOverlayRaf = null;
+let poseOverlayLastFrame = -1;
+
+function invalidatePoseOverlay() {
+  poseState.keypoints = null;
+  poseState.keypointsVideo = null;
+  poseOverlayLastFrame = -1;
+}
+
+async function ensurePoseKeypoints() {
+  if (poseState.keypoints && poseState.keypointsVideo === currentVideoName) return true;
+  const posePath = getPosePathFor(currentVideoName);
+  if (!posePath || poseState.selected.size === 0) return false;
+
+  // Guard against a slow response landing after the user switched videos.
+  const requestedFor = currentVideoName;
+  try {
+    const data = await backendFetch("/api/pose/keypoints", {
+      method: "POST",
+      body: JSON.stringify({
+        pose_path: posePath,
+        origin: poseState.origin,
+        bodyparts: [...poseState.selected],
+        animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
+        multi_animal: poseState.multiAnimal,
+      }),
+    });
+    if (currentVideoName !== requestedFor) return false;
+    poseState.keypoints = data;
+    poseState.keypointsVideo = requestedFor;
+    return true;
+  } catch (e) {
+    setStatus(`Pose overlay unavailable: ${e.message}`);
+    return false;
+  }
+}
+
+function sizePoseCanvas() {
+  if (!poseCanvas) return;
+  const w = video.videoWidth || videoCanvas.width || 0;
+  const h = video.videoHeight || videoCanvas.height || 0;
+  if (w && h && (poseCanvas.width !== w || poseCanvas.height !== h)) {
+    poseCanvas.width = w;
+    poseCanvas.height = h;
+  }
+}
+
+function drawPoseOverlay() {
+  if (!poseCtx || !poseState.keypoints) return;
+  sizePoseCanvas();
+  poseCtx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+
+  const frame = currentFrameIndex;
+  const pts = poseState.keypoints.points || [];
+  if (pts.length === 0) return;
+
+  const llhCutoff = parseFloat(poseEl("poseLlh").value) || 0.6;
+  const coords = [];
+  for (const p of pts) {
+    if (frame < 0 || frame >= p.x.length) return;
+    coords.push({ x: p.x[frame], y: p.y[frame], l: p.likelihood[frame], name: p.name });
+  }
+
+  // Connect every pair — the feature extractor uses all pairs, so this is an
+  // honest picture of what the model actually sees (rather than an invented
+  // anatomical skeleton we'd have to ask the user to define).
+  poseCtx.lineWidth = Math.max(1, poseCanvas.width / 800);
+  poseCtx.strokeStyle = "rgba(120, 190, 255, 0.25)";
+  for (let i = 0; i < coords.length; i++) {
+    for (let j = i + 1; j < coords.length; j++) {
+      if (coords[i].l < llhCutoff || coords[j].l < llhCutoff) continue;
+      poseCtx.beginPath();
+      poseCtx.moveTo(coords[i].x, coords[i].y);
+      poseCtx.lineTo(coords[j].x, coords[j].y);
+      poseCtx.stroke();
+    }
+  }
+
+  const r = Math.max(2, poseCanvas.width / 250);
+  for (const c of coords) {
+    // Confident points are cyan, low-likelihood ones red — so a bad prediction
+    // caused by bad tracking is visible at a glance while relabeling.
+    const good = c.l >= llhCutoff;
+    poseCtx.fillStyle = good ? "rgba(80, 220, 255, 0.95)" : "rgba(255, 80, 80, 0.95)";
+    poseCtx.beginPath();
+    poseCtx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    poseCtx.fill();
+    poseCtx.lineWidth = Math.max(1, r / 3);
+    poseCtx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+    poseCtx.stroke();
+  }
+}
+
+function poseOverlayTick() {
+  if (!poseEl("showPoseOverlay").checked) { poseOverlayRaf = null; return; }
+  if (currentFrameIndex !== poseOverlayLastFrame) {
+    poseOverlayLastFrame = currentFrameIndex;
+    drawPoseOverlay();
+  }
+  poseOverlayRaf = requestAnimationFrame(poseOverlayTick);
+}
+
+poseEl("showPoseOverlay").addEventListener("change", async () => {
+  const on = poseEl("showPoseOverlay").checked;
+  if (!poseCanvas) return;
+  if (!on) {
+    poseCanvas.style.display = "none";
+    if (poseOverlayRaf) cancelAnimationFrame(poseOverlayRaf);
+    poseOverlayRaf = null;
+    return;
+  }
+  const ready = await ensurePoseKeypoints();
+  if (!ready) {
+    poseEl("showPoseOverlay").checked = false;
+    setStatus("Attach a pose file and select body parts first.");
+    return;
+  }
+  poseCanvas.style.display = "block";
+  poseOverlayLastFrame = -1;
+  if (!poseOverlayRaf) poseOverlayTick();
+});
+
+// Called on video switch so one video's pose never draws over another.
+function resetPoseForVideo() {
+  invalidatePoseOverlay();
+  const p = getPosePathFor(currentVideoName);
+  setPathDisplay("posePath", p || "No pose file for this video");
+  if (poseCanvas && poseEl("showPoseOverlay").checked) {
+    // Re-fetch for the new video; leave the toggle on if it succeeds.
+    ensurePoseKeypoints().then((ok) => {
+      if (!ok) {
+        poseEl("showPoseOverlay").checked = false;
+        poseCanvas.style.display = "none";
+      } else {
+        poseOverlayLastFrame = -1;
+      }
+    });
+  }
+  if (p) {
+    inspectPoseFile(p).catch(() => { /* stale/unreadable file */ });
+  }
+  renderPoseVideoChecklist();
+}
 
 // ── Training Panel ────────────────────────────────────────────────────────
 
 const trainState = {
-  dataSources: [],        // manually-added external sources
-  selectedVideos: new Set(), // project video names checked for training
   taskId: null,
   sseSource: null,
-  lastBestCheckpoint: null, // best .ckpt from the most recent completed run
-  exportCkptPath: null,     // user-picked checkpoint for TorchScript export
+  iterations: 0,
 };
 
-// Render the project videos as a checklist; checked videos become training
-// data sources (frames + labels resolved from the project).
-async function renderTrainVideoChecklist() {
+function renderTrainVideoChecklist() {
   const container = document.getElementById("trainVideoChecklist");
   if (!container) return;
   container.innerHTML = "";
 
   const pm = window.projectManager;
   if (!pm || !pm.isActive()) {
-    container.innerHTML =
-      '<p class="muted">Open a project to pick videos here, or use “Add External Source”.</p>';
+    container.innerHTML = '<p class="muted">Open a project to select training videos.</p>';
     return;
   }
 
-  const manifest = pm.getManifest();
-  const vids = (manifest && manifest.videos) || [];
-  if (vids.length === 0) {
-    container.innerHTML = '<p class="muted">No videos in this project yet.</p>';
+  const names = videoList.map((v) => v.name);
+  if (names.length === 0) {
+    container.innerHTML = '<p class="muted">No videos in this project.</p>';
     return;
   }
 
-  for (const v of vids) {
-    const name = v.path ? v.path.split(/[\\/]/).pop() : v.id;
-    const framesDir = pm.getFramesDir(name);
-    const labelPath = pm.getVideoLabelsAbs(name);
-
+  for (const name of names) {
+    const id = pm.getVideoIdFromName(name);
+    const ready = poseState.extractedVideos.has(id) || !!getPosePathFor(name);
     const row = document.createElement("label");
     row.className = "checkbox-row";
-
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = trainState.selectedVideos.has(name);
-    cb.addEventListener("change", () => {
-      if (cb.checked) trainState.selectedVideos.add(name);
-      else trainState.selectedVideos.delete(name);
-    });
-
-    const text = document.createElement("span");
-    text.className = "checklist-name";
-    text.textContent = name;
-
-    const status = document.createElement("span");
-    status.className = "muted checklist-status";
-    status.textContent = "checking…";
-
-    row.append(cb, text, status);
+    cb.checked = ready;
+    cb.disabled = !ready;
+    cb.dataset.videoId = id;
+    const span = document.createElement("span");
+    span.textContent = ready ? name : `${name} (no features yet)`;
+    if (!ready) span.className = "muted";
+    row.append(cb, span);
     container.appendChild(row);
-
-    // Annotate availability of frames + labels asynchronously.
-    Promise.all([fileExists(framesDir), fileExists(labelPath)]).then(([hasFrames, hasLabels]) => {
-      status.textContent = `${hasLabels ? "✓" : "✗"} labels · ${hasFrames ? "✓" : "✗"} frames`;
-      if (!hasFrames || !hasLabels) {
-        row.title = "Missing " +
-          [!hasLabels ? "labels" : null, !hasFrames ? "frames (run Preprocess)" : null]
-            .filter(Boolean).join(" and ");
-      }
-    });
   }
 }
 
-// Add data source
-document.getElementById("trainAddSource").addEventListener("click", async () => {
-  if (!window.api) return;
-
-  const frameRes = await window.api.selectDirectory();
-  if (frameRes.canceled) return;
-
-  const labelRes = await window.api.selectFile({
-    title: "Select Label CSV",
-    filters: [{ name: "CSV", extensions: ["csv"] }],
-  });
-  if (labelRes.canceled) return;
-
-  trainState.dataSources.push({ frameDir: frameRes.path, labelPath: labelRes.path });
-  renderTrainDataSources();
-});
-
-function renderTrainDataSources() {
-  const container = document.getElementById("trainDataSources");
-  container.innerHTML = "";
-  trainState.dataSources.forEach((src, idx) => {
-    const row = document.createElement("div");
-    row.className = "data-source-row";
-    row.innerHTML = `
-      <div class="paths">
-        <span title="${src.frameDir}">Frames: ${src.frameDir}</span>
-        <span title="${src.labelPath}">Labels: ${src.labelPath}</span>
-      </div>
-      <button data-idx="${idx}">Remove</button>
-    `;
-    row.querySelector("button").addEventListener("click", () => {
-      trainState.dataSources.splice(idx, 1);
-      renderTrainDataSources();
-    });
-    container.appendChild(row);
-  });
+function selectedTrainVideoIds() {
+  const container = document.getElementById("trainVideoChecklist");
+  if (!container) return [];
+  return [...container.querySelectorAll("input[type=checkbox]")]
+    .filter((cb) => cb.checked && !cb.disabled)
+    .map((cb) => cb.dataset.videoId);
 }
 
-// Start training
-document.getElementById("trainStart").addEventListener("click", async () => {
-  // Combine checked project videos with any manually-added external sources.
-  const pm = window.projectManager;
-  const projectSources = [];
-  if (pm && pm.isActive()) {
-    for (const name of trainState.selectedVideos) {
-      const frameDir = pm.getFramesDir(name);
-      const labelPath = pm.getVideoLabelsAbs(name);
-      if (!frameDir || !labelPath) continue;
-      // Regenerate the on-disk label file from the canonical (frame-indexed)
-      // bouts right before training. This guarantees the trainer reads the
-      // frame-indexed one-hot format `load_data` expects — and migrates any
-      // label file still saved in the old timestamp bout format.
-      const videoBouts = name === currentVideoName
-        ? bouts
-        : ((loadProgress(name) || {}).bouts || []);
-      if (videoBouts.length > 0) {
-        try { await pm.saveVideoLabels(name, generateTrainingLabelCsv(videoBouts)); }
-        catch { /* fall back to whatever is on disk */ }
-      }
-      projectSources.push({ name, frameDir, labelPath });
-    }
-  }
-  const sources = [...projectSources, ...trainState.dataSources];
-  if (sources.length === 0) {
-    alert("Select at least one project video, or add an external data source.");
+function trainLog(line) {
+  const el = document.getElementById("trainLog");
+  if (!el) return;
+  el.style.display = "block";
+  el.textContent += line + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function applyTrainMetrics(data) {
+  const metrics = document.getElementById("trainMetrics");
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+
+  if (data.event === "ceiling") {
+    metrics.style.display = "grid";
+    set("trainCeilingF1", data.macro_f1.toFixed(3));
+    trainLog(`ceiling (all labeled data): macro F1 ${data.macro_f1.toFixed(3)} ` +
+             `on ${data.n_train} samples`);
     return;
   }
 
-  // Pre-flight: confirm the labeled frames are actually preprocessed. load_data
-  // silently drops labeled frames whose PNGs (or clip context) are missing, so
-  // warn before launching a run that would quietly ignore part of the labels.
-  const framesPerGroup = parseInt(document.getElementById("trainFramesPerGroup").value) || 3;
-  try {
-    const cov = await backendFetch("/api/training/check-coverage", {
-      method: "POST",
-      body: JSON.stringify({
-        frame_dirs: sources.map((s) => s.frameDir),
-        label_paths: sources.map((s) => s.labelPath),
-        frames_per_group: framesPerGroup,
-      }),
-    });
-    const problems = [];
-    (cov.datasets || []).forEach((d, i) => {
-      const name = (sources[i] && sources[i].name)
-        || String(d.frame_dir).split(/[\\/]/).filter(Boolean).pop()
-        || `source ${i + 1}`;
-      if (d.error) problems.push(`• ${name}: ${d.error}`);
-      else if (d.not_extracted > 0) {
-        problems.push(`• ${name}: ${d.not_extracted} of ${d.labeled} labeled frames not preprocessed`);
-      }
-    });
-    if (problems.length) {
-      const proceed = confirm(
-        "Some labeled frames aren't preprocessed and will be IGNORED during training:\n\n" +
-        problems.join("\n") +
-        `\n\nTraining would use ${cov.total_ready} of ${cov.total_labeled} labeled frames.\n` +
-        "Run Preprocess on those videos to include them.\n\n" +
-        "Proceed with training anyway?"
-      );
-      if (!proceed) {
-        document.getElementById("trainStatus").textContent =
-          "Cancelled — run Preprocess on the labeled frames first.";
-        return;
-      }
+  if (data.event === "iteration") {
+    metrics.style.display = "grid";
+    trainState.iterations = data.iteration;
+    set("trainIteration", data.iteration);
+    set("trainTotalIters", document.getElementById("trainMaxIter").value);
+    set("trainMacroF1", data.macro_f1.toFixed(3));
+    set("trainNSamples", data.n_train);
+    set("trainLowConf", data.n_lowconf_remaining);
+    set("trainPerClassF1", (data.f1_per_class || []).map((f) => f.toFixed(2)).join(", "));
+    if (data.ceiling_macro_f1 !== undefined) {
+      set("trainCeilingF1", data.ceiling_macro_f1.toFixed(3));
     }
-  } catch (e) {
-    // Never hard-block training because the check itself failed; just log it.
-    console.warn("[train] coverage check failed", e);
+    const pct = Math.min(100, Math.round(
+      (data.iteration / (parseInt(document.getElementById("trainMaxIter").value, 10) || 1)) * 100
+    ));
+    document.getElementById("trainProgress").value = pct;
+    trainLog(`iter ${String(data.iteration).padStart(3)}  macro F1 ${data.macro_f1.toFixed(3)}  ` +
+             `samples ${data.n_train}  low-confidence left ${data.n_lowconf_remaining}`);
+    return;
   }
 
-  const tsmStagesStr = document.getElementById("trainTsmStages").value;
-  const tsmStages = tsmStagesStr.split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n));
+  if (data.message) trainLog(data.message);
+  if (data.error) trainLog(`ERROR: ${data.error}`);
+}
 
-  // Positive class from the binarize checklist:
-  //   0 checked → multi-class; 1 → binarize that behavior;
-  //   ≥2 → union them into one positive label (label_union), then binarize it.
-  const positive = behaviors.map((b) => b.name).filter((n) => binarizeSelected.has(n));
-  let binarize = null;
-  let labelUnion = null;
-  if (positive.length === 1) {
-    binarize = positive[0];
-  } else if (positive.length >= 2) {
-    const existing = new Set(behaviors.map((b) => b.name));
-    let unionName = "positive";
-    while (existing.has(unionName)) unionName += "_";
-    binarize = unionName;
-    labelUnion = { [unionName]: positive };
+document.getElementById("trainStart").addEventListener("click", async () => {
+  const pm = window.projectManager;
+  if (!pm || !pm.isActive()) { alert("Open a project first."); return; }
+
+  const videoIds = selectedTrainVideoIds();
+  if (videoIds.length === 0) {
+    alert("No videos with extracted features are selected. Run the Pose tab first.");
+    return;
   }
 
+  // binarizeSelected holds behavior NAMES: 0 = multi-class, 1 = binarize that
+  // behavior, >=2 = union them into one positive class first.
+  const positives = [...binarizeSelected];
   const config = {
-    label_paths: sources.map((s) => s.labelPath),
-    frame_dirs: sources.map((s) => s.frameDir),
-    frames_per_group: framesPerGroup,
-    binarize: binarize,
-    label_union: labelUnion,
-    train_percent: parseFloat(document.getElementById("trainSplitTrain").value),
-    val_percent: parseFloat(document.getElementById("trainSplitVal").value),
-    test_percent: parseFloat(document.getElementById("trainSplitTest").value),
-    num_frames: framesPerGroup,
-    variant: document.getElementById("trainVariant").value,
-    shift_fraction: 0.125,
-    pretrained: true,
-    tsm_stages: tsmStages,
-    dropout: parseFloat(document.getElementById("trainDropout").value),
-    lr: parseFloat(document.getElementById("trainLr").value),
-    weight_decay: parseFloat(document.getElementById("trainWeightDecay").value),
-    temporal_pool: document.getElementById("trainTemporalPool").value,
-    max_epochs: parseInt(document.getElementById("trainMaxEpochs").value),
-    early_stopping_patience: parseInt(document.getElementById("trainPatience").value),
-    boundary_smoothing_enabled: document.getElementById("trainBoundarySmoothing").checked,
-    boundary_smoothing_epsilon: parseFloat(document.getElementById("trainBsEpsilon").value),
-    boundary_smoothing_window: parseInt(document.getElementById("trainBsWindow").value),
-    use_wandb: document.getElementById("trainUseWandb").checked,
-    project_name: document.getElementById("trainWandbProject").value.trim() || "realtime-asoid",
-    run_name: document.getElementById("trainWandbRunName").value.trim() || undefined,
-    wandb_api_key: document.getElementById("trainWandbApiKey").value.trim() || undefined,
+    project_dir: pm.getProjectRoot(),
+    video_ids: videoIds,
+    iteration_dir: currentIterationDir(),
+    init_ratio: parseFloat(document.getElementById("trainInitRatio").value) || 0.01,
+    max_iter: parseInt(document.getElementById("trainMaxIter").value, 10) || 100,
+    max_samples_iter: parseInt(document.getElementById("trainMaxSamplesIter").value, 10) || 20,
+    conf_threshold: parseFloat(document.getElementById("trainConfThreshold").value) || 0.5,
+    exclude_other: document.getElementById("trainExcludeOther").checked,
+    binarize: positives.length === 1 ? positives[0] : null,
+    label_union: positives.length > 1 ? positives : null,
+    checkpoint_dir: pm.getCheckpointsDir(),
+    model_name: document.getElementById("trainModelName").value || "rf_model",
   };
 
-  // If a project is open, save checkpoints into it so the model path is stable
-  // and can be recorded in the manifest (otherwise it lands in a temp dir).
-  if (window.projectManager && window.projectManager.isActive()) {
-    config.checkpoint_dir = window.projectManager.getCheckpointsDir();
-  }
+  try { pm.updateTrainingConfig(config); } catch { /* manifest not ready */ }
 
+  document.getElementById("trainLog").textContent = "";
   document.getElementById("trainStart").disabled = true;
   document.getElementById("trainStop").disabled = false;
   document.getElementById("trainStatus").textContent = "Starting...";
-  document.getElementById("trainMetrics").style.display = "grid";
-  const trainLogEl = document.getElementById("trainLog");
-  trainLogEl.textContent = "";
-  trainLogEl.style.display = "block";
-  const appendTrainLog = (line) => {
-    trainLogEl.textContent += (trainLogEl.textContent ? "\n" : "") + line;
-    trainLogEl.scrollTop = trainLogEl.scrollHeight;
-  };
+  document.getElementById("trainProgress").value = 0;
 
   try {
     const res = await backendFetch("/api/training/start", {
@@ -3873,92 +3956,38 @@ document.getElementById("trainStart").addEventListener("click", async () => {
     trainState.sseSource = backendSSE(
       `/api/training/status/${res.task_id}`,
       (data) => {
-        // Verbose startup/progress lines from the subprocess.
-        if (data.message) {
-          appendTrainLog(data.message);
-          document.getElementById("trainStatus").textContent = data.message;
-        } else {
-          document.getElementById("trainStatus").textContent = data.status || "training";
-        }
-        if (data.epoch !== undefined) {
-          document.getElementById("trainEpoch").textContent = data.epoch + 1;
-          document.getElementById("trainTotalEpochs").textContent = data.total_epochs || "-";
-          const pct = data.total_epochs ? Math.round(((data.epoch + 1) / data.total_epochs) * 100) : 0;
-          document.getElementById("trainProgress").value = pct;
-          // Per-epoch summary line in the log (skip the final completion event,
-          // which carries no train_loss).
-          if (data.train_loss !== undefined && data.status === "training") {
-            const parts = [
-              `epoch ${data.epoch + 1}/${data.total_epochs || "?"}`,
-              `train_loss ${data.train_loss.toFixed(4)}`,
-              `val_loss ${data.val_loss.toFixed(4)}`,
-            ];
-            if (data.val_mcc !== undefined)
-              parts.push(`val_mcc ${data.val_mcc.toFixed(4)}`);
-            // stagnation now tracks val_mcc (the early-stopping metric)
-            if (data.stagnation_epochs !== undefined)
-              parts.push(`stagnation ${data.stagnation_epochs}/${data.patience}`);
-            appendTrainLog(parts.join("  "));
-          }
-        }
-        if (data.train_loss !== undefined) document.getElementById("trainLossVal").textContent = data.train_loss.toFixed(4);
-        if (data.val_loss !== undefined) document.getElementById("trainValLoss").textContent = data.val_loss.toFixed(4);
-        if (typeof data.best_val_loss === "number" && isFinite(data.best_val_loss))
-          document.getElementById("trainBestValLoss").textContent = data.best_val_loss.toFixed(4);
-        if (data.val_mcc !== undefined) document.getElementById("trainValMcc").textContent = data.val_mcc.toFixed(4);
-        if (typeof data.best_val_mcc === "number" && isFinite(data.best_val_mcc))
-          document.getElementById("trainBestValMcc").textContent = data.best_val_mcc.toFixed(4);
-        if (data.stagnation_epochs !== undefined) {
-          const patience = data.patience !== undefined ? data.patience : "-";
-          document.getElementById("trainStagnation").textContent = `${data.stagnation_epochs} / ${patience}`;
-        }
-        if (data.train_acc !== undefined) document.getElementById("trainAccVal").textContent = (data.train_acc * 100).toFixed(1) + "%";
-        if (data.val_acc !== undefined) document.getElementById("trainValAcc").textContent = (data.val_acc * 100).toFixed(1) + "%";
-        if (data.lr !== undefined) document.getElementById("trainLrVal").textContent = data.lr.toExponential(2);
-
-        if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
+        applyTrainMetrics(data);
+        if (data.status === "completed") {
           trainState.sseSource?.close();
           document.getElementById("trainStart").disabled = false;
           document.getElementById("trainStop").disabled = true;
-          if (data.status === "error") {
-            const detail = (data.error || "").trim();
-            const statusEl = document.getElementById("trainStatus");
-            statusEl.textContent = detail
-              ? `Error: ${detail.split("\n").pop()}`
-              : "Error (no details returned by backend)";
-            statusEl.title = detail || "";
-            if (detail) {
-              console.error("[training] subprocess failed:\n" + detail);
-              appendTrainLog("\nERROR:\n" + detail);
-            }
-          } else if (data.status === "cancelled") {
-            appendTrainLog("\nCancelled.");
-          }
-          if (data.best_checkpoint) {
-            document.getElementById("trainStatus").textContent = `Done! Best: ${data.best_checkpoint}`;
-            trainState.lastBestCheckpoint = data.best_checkpoint;
-            // Auto-record the trained checkpoint into the project manifest so it
-            // travels with the .rlt as a reference (re-linkable on import).
-            if (data.status === "completed" && window.projectManager && window.projectManager.isActive()) {
-              window.projectManager.addModel({
-                name: data.best_checkpoint.split(/[\\/]/).pop(),
-                path: data.best_checkpoint,
+          document.getElementById("trainProgress").value = 100;
+          document.getElementById("trainStatus").textContent =
+            `Done: macro F1 ${(data.macro_f1 ?? 0).toFixed(3)} in ${data.iterations} iterations`;
+          if (data.checkpoint_path) {
+            // Record the model so the AL tab can find it and validate its
+            // body-part selection against the current one.
+            try {
+              pm.addModel({
+                name: data.checkpoint_path.split(/[\\/]/).pop(),
+                path: data.checkpoint_path,
                 created: new Date().toISOString().slice(0, 10),
-                val_mcc: typeof data.best_val_mcc === "number" ? data.best_val_mcc : null,
-                val_loss: typeof data.best_val_loss === "number" ? data.best_val_loss : null,
-                config: {
-                  variant: config.variant,
-                  binarize: config.binarize,
-                  // Needed to map original behavior names into this model's
-                  // collapsed label space when scoring Active Learning
-                  // predictions (see mapLabelToModelClass).
-                  label_union: config.label_union,
-                  num_frames: config.num_frames,
-                  tsm_stages: config.tsm_stages,
-                },
+                source: "trained",
+                config,
               });
-            }
+            } catch { /* manifest not ready */ }
+            alState.checkpointPath = data.checkpoint_path;
+            setPathDisplay("alCheckpointPath", data.checkpoint_path);
+            trainLog(`checkpoint: ${data.checkpoint_path}`);
           }
+        } else if (data.status === "error" || data.status === "cancelled") {
+          trainState.sseSource?.close();
+          document.getElementById("trainStart").disabled = false;
+          document.getElementById("trainStop").disabled = true;
+          document.getElementById("trainStatus").textContent =
+            data.status === "cancelled" ? "Cancelled" : `Error: ${data.error || "unknown"}`;
+        } else {
+          document.getElementById("trainStatus").textContent = data.status || "running";
         }
       },
       () => {
@@ -3973,125 +4002,182 @@ document.getElementById("trainStart").addEventListener("click", async () => {
   }
 });
 
-// Stop training
 document.getElementById("trainStop").addEventListener("click", async () => {
-  if (trainState.taskId) {
-    try {
-      await backendFetch(`/api/training/stop/${trainState.taskId}`, { method: "POST" });
-    } catch { /* ignore */ }
-  }
+  if (!trainState.taskId) return;
+  try { await backendFetch(`/api/training/stop/${trainState.taskId}`, { method: "POST" }); }
+  catch { /* already finished */ }
 });
 
-// ── Inference benchmark (pre-training compute budget) ───────────────────────
-// Times the optimized (TorchScript) forward pass for the CURRENT architecture
-// without training it — latency depends on architecture + input shape, not on
-// trained weights — so users can decide if a variant fits their rig's frame rate.
-document.getElementById("benchInfer").addEventListener("click", async () => {
-  const btn = document.getElementById("benchInfer");
-  const out = document.getElementById("benchResult");
-  const tsmStages = document.getElementById("trainTsmStages").value
-    .split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n));
-  const body = {
-    variant: document.getElementById("trainVariant").value,
-    num_frames: parseInt(document.getElementById("trainFramesPerGroup").value, 10) || 3,
-    tsm_stages: tsmStages,
-    temporal_pool: document.getElementById("trainTemporalPool").value,
-    precision: document.getElementById("benchFp16").checked ? "fp16" : "fp32",
-  };
+// ── Batch Predict Panel ───────────────────────────────────────────────────
 
-  btn.disabled = true;
-  out.style.display = "block";
-  out.textContent = "Building + tracing model, timing…";
-  try {
-    const r = await backendFetch("/api/training/benchmark-inference", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    const fps30 = (r.clips_per_sec / 30).toFixed(1);
-    const fps60 = (r.clips_per_sec / 60).toFixed(1);
-    out.innerHTML = "";
-    const rows = [
-      `Architecture: ${r.variant}, T=${r.num_frames}, stages [${(r.tsm_stages || []).join(",")}], pool ${r.temporal_pool}`,
-      `Device: ${r.device_name} (${r.precision.toUpperCase()})`,
-      `Latency: ${r.ms_per_clip.toFixed(2)} ms/clip  →  ${r.clips_per_sec.toFixed(1)} clips/s`,
-      `Real-time headroom: ${fps30}× at 30 fps · ${fps60}× at 60 fps`,
-    ];
-    if (r.note) rows.push(`Note: ${r.note}`);
-    for (const line of rows) {
-      const div = document.createElement("div");
-      div.textContent = line;
-      out.appendChild(div);
-    }
-  } catch (e) {
-    out.textContent = `Benchmark failed: ${e.message || e}`;
-  } finally {
-    btn.disabled = false;
-  }
-});
+const predState = {
+  checkpointPath: null,
+  files: [],
+  outDir: null,
+  taskId: null,
+  sseSource: null,
+};
 
-// ── TorchScript export ─────────────────────────────────────────────────────
-
-document.getElementById("trainExportSelectCkpt").addEventListener("click", async () => {
-  if (!window.api || !window.api.selectFile) return;
-  const res = await window.api.selectFile({
-    title: "Select Checkpoint (.ckpt)",
-    filters: [{ name: "Checkpoint", extensions: ["ckpt"] }],
-  });
-  if (res.canceled) return;
-  trainState.exportCkptPath = res.path;
-  document.getElementById("trainExportCkptPath").textContent = res.path;
-});
-
-document.getElementById("trainExportRun").addEventListener("click", async () => {
-  const statusEl = document.getElementById("trainExportStatus");
-  const checkpointPath = trainState.exportCkptPath || trainState.lastBestCheckpoint;
-  if (!checkpointPath) {
-    statusEl.textContent = "No checkpoint — train a model or pick a .ckpt first.";
+function renderPredFileList() {
+  const container = document.getElementById("predFileList");
+  if (!container) return;
+  container.innerHTML = "";
+  if (predState.files.length === 0) {
+    container.innerHTML = '<p class="muted">No pose files selected.</p>';
     return;
   }
-
-  // Save into the project's models/exports when a project is open; otherwise ask.
-  const pm = window.projectManager;
-  let outputDir = pm && pm.isActive() ? pm.getExportsDir() : null;
-  if (!outputDir) {
-    const dirRes = await window.api.selectDirectory({ title: "Select output folder for .pt" });
-    if (dirRes.canceled) return;
-    outputDir = dirRes.path;
+  for (const f of predState.files) {
+    const row = document.createElement("div");
+    row.className = "data-source-row";
+    const span = document.createElement("span");
+    span.textContent = f.split(/[\\/]/).pop();
+    span.title = f;
+    const btn = document.createElement("button");
+    btn.className = "ghost";
+    btn.textContent = "×";
+    btn.addEventListener("click", () => {
+      predState.files = predState.files.filter((x) => x !== f);
+      renderPredFileList();
+    });
+    row.append(span, btn);
+    container.appendChild(row);
   }
+}
 
-  const outputName = (document.getElementById("trainExportName").value || "tsm_model").trim();
-  const tsmStages = document.getElementById("trainTsmStages").value
-    .split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n));
+function predLog(line) {
+  const el = document.getElementById("predLog");
+  if (!el) return;
+  el.style.display = "block";
+  el.textContent += line + "\n";
+  el.scrollTop = el.scrollHeight;
+}
 
-  const btn = document.getElementById("trainExportRun");
-  btn.disabled = true;
-  statusEl.textContent = "Exporting…";
+document.getElementById("predSelectCheckpoint").addEventListener("click", async () => {
+  if (!window.api) return;
+  const res = await window.api.selectFile({
+    title: "Select Model",
+    filters: [{ name: "Models", extensions: ["joblib"] }],
+  });
+  if (res.canceled) return;
+  predState.checkpointPath = res.path;
+  setPathDisplay("predCheckpointPath", res.path);
+});
+
+document.getElementById("predAddFiles").addEventListener("click", async () => {
+  if (!window.api) return;
+  const res = await window.api.selectFiles({
+    title: "Select Pose Files",
+    filters: [
+      { name: "Pose files", extensions: ["csv", "h5", "mat", "txt"] },
+      { name: "All Files", extensions: ["*"] },
+    ],
+  });
+  if (res.canceled) return;
+  for (const p of res.paths) if (!predState.files.includes(p)) predState.files.push(p);
+  renderPredFileList();
+});
+
+document.getElementById("predClearFiles").addEventListener("click", () => {
+  predState.files = [];
+  renderPredFileList();
+});
+
+document.getElementById("predSelectOutDir").addEventListener("click", async () => {
+  if (!window.api) return;
+  const res = await window.api.selectDirectory();
+  if (res.canceled) return;
+  predState.outDir = res.path;
+  setPathDisplay("predOutDir", res.path);
+});
+
+document.getElementById("predRun").addEventListener("click", async () => {
+  if (!predState.checkpointPath) { alert("Select a model first."); return; }
+  if (predState.files.length === 0) { alert("Add at least one pose file."); return; }
+
+  const pm = window.projectManager;
+  const outDir = predState.outDir
+    || (pm && pm.isActive() ? pm.getProjectRoot() + "/predictions" : null);
+  if (!outDir) { alert("Choose an output folder (or open a project)."); return; }
+
+  document.getElementById("predLog").textContent = "";
+  document.getElementById("predRun").disabled = true;
+  document.getElementById("predStop").disabled = false;
+  document.getElementById("predStatus").textContent = "Starting...";
+
   try {
-    const res = await backendFetch("/api/training/export-torchscript", {
+    const res = await backendFetch("/api/inference/batch", {
       method: "POST",
       body: JSON.stringify({
-        checkpoint_path: checkpointPath,
-        output_name: outputName,
-        output_dir: outputDir,
-        tsm_stages: tsmStages.length ? tsmStages : null,
+        checkpoint_path: predState.checkpointPath,
+        pose_paths: predState.files,
+        output_dir: outDir,
+        origin: poseState.origin,
+        // Body parts default to whatever the checkpoint was trained on, which
+        // is the only selection guaranteed to match its feature space.
+        bodyparts: null,
+        llh_value: parseFloat(poseEl("poseLlh").value) || 0.6,
+        animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
+        multi_animal: poseState.multiAnimal,
       }),
     });
-    statusEl.textContent = `Exported: ${res.output_path}`;
-    // Record the export in the project manifest so it travels with the .rlt.
-    if (pm && pm.isActive() && pm.addModel) {
-      pm.addModel({
-        name: res.output_path.split(/[\\/]/).pop(),
-        path: res.output_path,
-        created: new Date().toISOString().slice(0, 10),
-        kind: "torchscript",
-      });
-    }
+    predState.taskId = res.task_id;
+
+    predState.sseSource = backendSSE(
+      `/api/inference/status/${res.task_id}`,
+      async (data) => {
+        const pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
+        document.getElementById("predProgress").value = pct;
+        document.getElementById("predStatus").textContent =
+          `${data.status}: ${data.progress}/${data.total}`;
+
+        if (data.status === "completed") {
+          predState.sseSource?.close();
+          document.getElementById("predRun").disabled = false;
+          document.getElementById("predStop").disabled = true;
+          try {
+            const out = await backendFetch(`/api/inference/results/${predState.taskId}`);
+            for (const f of out.files || []) {
+              predLog(`${f.output_path.split(/[\\/]/).pop()}  (${f.n_frames} frames)`);
+              for (const [name, s] of Object.entries(f.summary || {})) {
+                predLog(`    ${name}: ${s.frames} frames, mean uncertainty ${s.mean_uncertainty}`);
+              }
+            }
+            document.getElementById("predStatus").textContent =
+              `Done: ${(out.files || []).length} file(s) -> ${out.output_dir}`;
+          } catch (e) {
+            document.getElementById("predStatus").textContent = `Error: ${e.message}`;
+          }
+        } else if (data.status === "error" || data.status === "cancelled") {
+          predState.sseSource?.close();
+          document.getElementById("predRun").disabled = false;
+          document.getElementById("predStop").disabled = true;
+          if (data.error) {
+            document.getElementById("predStatus").textContent = `Error: ${data.error}`;
+            predLog(data.error);
+          }
+        }
+      },
+      () => {
+        document.getElementById("predRun").disabled = false;
+        document.getElementById("predStop").disabled = true;
+      }
+    );
   } catch (e) {
-    statusEl.textContent = `Export failed: ${e.message}`;
-  } finally {
-    btn.disabled = false;
+    document.getElementById("predStatus").textContent = `Error: ${e.message}`;
+    document.getElementById("predRun").disabled = false;
+    document.getElementById("predStop").disabled = true;
   }
 });
+
+document.getElementById("predStop").addEventListener("click", async () => {
+  if (!predState.taskId) return;
+  try { await backendFetch(`/api/inference/stop/${predState.taskId}`, { method: "POST" }); }
+  catch { /* already finished */ }
+});
+
+renderPredFileList();
+renderPoseBodypartList();
+renderPoseAnimalList();
 
 // ── Active Learning Panel ─────────────────────────────────────────────────
 
@@ -4320,7 +4406,7 @@ document.getElementById("alSelectCheckpoint").addEventListener("click", async ()
   if (!window.api) return;
   const res = await window.api.selectFile({
     title: "Select Model Checkpoint",
-    filters: [{ name: "Checkpoints", extensions: ["ckpt", "pt"] }],
+    filters: [{ name: "Models", extensions: ["joblib"] }],
   });
   if (!res.canceled) {
     alState.checkpointPath = res.path;
@@ -4387,20 +4473,19 @@ function resolveAlFrameRanges() {
   return { ranges: null };
 }
 
-// Run inference — decodes + crops the current video on the fly (no frame dir).
+// Run inference on this video's pose file. Body parts and bin width come from
+// the checkpoint itself, so the feature space always matches how it was trained.
 document.getElementById("alRunInference").addEventListener("click", async () => {
   if (!alState.checkpointPath) { alert("Select a checkpoint first."); return; }
-  const videoPath = getVideoPath();
-  if (!videoPath) { alert("Load a video first."); return; }
+  const posePath = getPosePathFor(currentVideoName);
+  if (!posePath) {
+    alert("This video has no pose file attached. Attach one in the Pose tab first.");
+    return;
+  }
 
   const scopeResult = resolveAlFrameRanges();
   if (scopeResult.error) { alert(scopeResult.error); return; }
   const frameRanges = scopeResult.ranges;
-
-  const pm = window.projectManager;
-  const bgPath = pm && pm.isActive() ? pm.getVideoBackgroundAbs(currentVideoName) : ppState.bgPath;
-
-  const framesPerGroup = parseInt(document.getElementById("alFramesPerGroup").value) || 3;
 
   document.getElementById("alRunInference").disabled = true;
   document.getElementById("alStopInference").disabled = false;
@@ -4411,10 +4496,13 @@ document.getElementById("alRunInference").addEventListener("click", async () => 
       method: "POST",
       body: JSON.stringify({
         checkpoint_path: alState.checkpointPath,
-        video_path: videoPath,
-        bg_path: bgPath || null,
-        crop_params: getCropParams(),
-        frames_per_group: framesPerGroup,
+        pose_path: posePath,
+        origin: poseState.origin,
+        // null = use the checkpoint's own body-part selection.
+        bodyparts: null,
+        llh_value: parseFloat(document.getElementById("poseLlh").value) || 0.6,
+        animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
+        multi_animal: poseState.multiAnimal,
         frame_ranges: frameRanges,
       }),
     });
@@ -4798,6 +4886,46 @@ const generatePredictionsCsv = () => {
   return [header, ...rows].join("\n");
 };
 
+// Collapse per-frame predictions into contiguous same-class intervals, in the
+// same {startFrame, endFrame, behaviorName} shape as a bout — so the labeled
+// video renderer, which already knows how to burn bouts in, takes them as-is.
+// "other" runs are skipped: it means "no behavior", not a behavior to caption.
+function predictionSegments() {
+  if (!alState.results || !alState.results.frames.length) return [];
+  const classNames = alState.results.class_names || [];
+  const frames = alState.results.frames;
+
+  const segments = [];
+  let run = null;
+  for (const f of frames) {
+    const name = classNames[f.predicted_class] ?? `class ${f.predicted_class}`;
+    // Break the run on a class change OR a gap in frame indices (scoped
+    // inference returns only the requested ranges).
+    if (run && run.behaviorName === name && f.index === run.endFrame + 1) {
+      run.endFrame = f.index;
+    } else {
+      if (run && run.behaviorName !== "other") segments.push(run);
+      run = { startFrame: f.index, endFrame: f.index, behaviorName: name };
+    }
+  }
+  if (run && run.behaviorName !== "other") segments.push(run);
+  return segments;
+}
+
+document.getElementById("alPredictedVideo").addEventListener("click", async () => {
+  if (!alState.results || !alState.results.frames.length) {
+    alert("Run inference first.");
+    return;
+  }
+  const segments = predictionSegments();
+  if (segments.length === 0) {
+    setStatus("Every frame was predicted 'other' — nothing to caption.");
+    return;
+  }
+  setStatus(`Rendering ${segments.length} predicted segments...`);
+  await generateLabeledVideo(segments);
+});
+
 document.getElementById("alExportPredictions").addEventListener("click", async () => {
   if (!alState.results || !alState.results.frames.length) {
     alert("Run inference first.");
@@ -4822,41 +4950,30 @@ document.getElementById("alExportPredictions").addEventListener("click", async (
 
 // ── Settings persistence ──────────────────────────────────────────────────
 
-const SETTINGS_KEY = "realtimeASOID_settings";
+const SETTINGS_KEY = "asoidDesktop_settings";
 
 function saveSettings() {
   const settings = {
-    // Crop params
-    cropParams: getCropParams(),
-    bgNumFrames: parseInt(document.getElementById("ppBgNumFrames").value),
+    // Pose / feature extraction
+    poseOrigin: document.getElementById("poseOrigin").value,
+    poseMultiAnimal: document.getElementById("poseMultiAnimal").checked,
+    poseFramerate: parseFloat(document.getElementById("poseFramerate").value),
+    poseLlh: parseFloat(document.getElementById("poseLlh").value),
+    poseMinDuration: parseFloat(document.getElementById("poseMinDuration").value),
+    poseByVideo: poseState.poseByVideo,
+    poseSelectedBodyparts: [...poseState.selected],
     // Training config
-    trainVariant: document.getElementById("trainVariant").value,
-    trainFramesPerGroup: parseInt(document.getElementById("trainFramesPerGroup").value),
-    trainTsmStages: document.getElementById("trainTsmStages").value,
-    trainTemporalPool: document.getElementById("trainTemporalPool").value,
-    trainLr: parseFloat(document.getElementById("trainLr").value),
-    trainWeightDecay: parseFloat(document.getElementById("trainWeightDecay").value),
-    trainDropout: parseFloat(document.getElementById("trainDropout").value),
-    trainMaxEpochs: parseInt(document.getElementById("trainMaxEpochs").value),
-    trainPatience: parseInt(document.getElementById("trainPatience").value),
-    trainSplitTrain: parseFloat(document.getElementById("trainSplitTrain").value),
-    trainSplitVal: parseFloat(document.getElementById("trainSplitVal").value),
-    trainSplitTest: parseFloat(document.getElementById("trainSplitTest").value),
+    trainInitRatio: parseFloat(document.getElementById("trainInitRatio").value),
+    trainMaxIter: parseInt(document.getElementById("trainMaxIter").value),
+    trainMaxSamplesIter: parseInt(document.getElementById("trainMaxSamplesIter").value),
+    trainConfThreshold: parseFloat(document.getElementById("trainConfThreshold").value),
+    trainExcludeOther: document.getElementById("trainExcludeOther").checked,
+    trainModelName: document.getElementById("trainModelName").value,
     binarizeSelected: [...binarizeSelected],
-    trainBoundarySmoothing: document.getElementById("trainBoundarySmoothing").checked,
-    trainBsEpsilon: parseFloat(document.getElementById("trainBsEpsilon").value),
-    trainBsWindow: parseInt(document.getElementById("trainBsWindow").value),
     // Active learning
     alThreshold: parseFloat(alThresholdSlider.value),
     alMinSegment: getMinSegmentLength(),
-    alFramesPerGroup: parseInt(document.getElementById("alFramesPerGroup").value),
-    // Paths (last used)
-    lastBgPath: ppState.bgPath,
-    bgByVideo: ppState.bgByVideo,
-    cropByVideo: ppState.cropByVideo,
     lastCheckpointPath: alState.checkpointPath,
-    // Data sources
-    trainDataSources: trainState.dataSources,
   };
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -4869,34 +4986,38 @@ function loadSettings() {
     if (!raw) return;
     const s = JSON.parse(raw);
 
-    // Crop params (global last-used defaults; per-video overrides apply on switch)
-    if (s.cropParams) applyCropParams(s.cropParams);
-    if (s.cropByVideo && typeof s.cropByVideo === "object") ppState.cropByVideo = s.cropByVideo;
-    if (s.bgNumFrames) document.getElementById("ppBgNumFrames").value = s.bgNumFrames;
-
-    // Training config
     const setVal = (id, val) => { if (val !== undefined && val !== null) document.getElementById(id).value = val; };
     const setChecked = (id, val) => { if (val !== undefined) document.getElementById(id).checked = val; };
-    setVal("trainVariant", s.trainVariant);
-    setVal("trainFramesPerGroup", s.trainFramesPerGroup);
-    setVal("trainTsmStages", s.trainTsmStages);
-    setVal("trainTemporalPool", s.trainTemporalPool);
-    setVal("trainLr", s.trainLr);
-    setVal("trainWeightDecay", s.trainWeightDecay);
-    setVal("trainDropout", s.trainDropout);
-    setVal("trainMaxEpochs", s.trainMaxEpochs);
-    setVal("trainPatience", s.trainPatience);
-    setVal("trainSplitTrain", s.trainSplitTrain);
-    setVal("trainSplitVal", s.trainSplitVal);
-    setVal("trainSplitTest", s.trainSplitTest);
+
+    // Pose / feature extraction
+    setVal("poseOrigin", s.poseOrigin);
+    setChecked("poseMultiAnimal", s.poseMultiAnimal);
+    setVal("poseFramerate", s.poseFramerate);
+    setVal("poseLlh", s.poseLlh);
+    setVal("poseMinDuration", s.poseMinDuration);
+    if (s.poseOrigin) poseState.origin = s.poseOrigin;
+    if (s.poseMultiAnimal !== undefined) poseState.multiAnimal = s.poseMultiAnimal;
+    if (s.poseByVideo && typeof s.poseByVideo === "object") {
+      poseState.poseByVideo = s.poseByVideo;
+    }
+    // The body-part list itself is repopulated from the pose file on load;
+    // this only restores which of them were ticked.
+    if (Array.isArray(s.poseSelectedBodyparts)) {
+      poseState.selected = new Set(s.poseSelectedBodyparts);
+    }
+
+    // Training config
+    setVal("trainInitRatio", s.trainInitRatio);
+    setVal("trainMaxIter", s.trainMaxIter);
+    setVal("trainMaxSamplesIter", s.trainMaxSamplesIter);
+    setVal("trainConfThreshold", s.trainConfThreshold);
+    setChecked("trainExcludeOther", s.trainExcludeOther);
+    setVal("trainModelName", s.trainModelName);
     if (Array.isArray(s.binarizeSelected)) {
       binarizeSelected.clear();
       s.binarizeSelected.forEach((n) => binarizeSelected.add(n));
       renderBinarizeChecklist();
     }
-    setChecked("trainBoundarySmoothing", s.trainBoundarySmoothing);
-    setVal("trainBsEpsilon", s.trainBsEpsilon);
-    setVal("trainBsWindow", s.trainBsWindow);
 
     // Active learning
     if (s.alThreshold !== undefined) {
@@ -4904,26 +5025,12 @@ function loadSettings() {
       alThresholdOutput.textContent = s.alThreshold.toFixed(2);
     }
     if (s.alMinSegment !== undefined) alMinSegmentInput.value = s.alMinSegment;
-    if (s.alFramesPerGroup) document.getElementById("alFramesPerGroup").value = s.alFramesPerGroup;
-
-    // Restore paths
-    if (s.bgByVideo && typeof s.bgByVideo === "object") {
-      ppState.bgByVideo = s.bgByVideo;
-    }
-    if (s.lastBgPath) {
-      ppState.bgPath = s.lastBgPath;
-      setPathDisplay("ppBgPath", s.lastBgPath);
-    }
     if (s.lastCheckpointPath) {
       alState.checkpointPath = s.lastCheckpointPath;
       setPathDisplay("alCheckpointPath", s.lastCheckpointPath);
     }
 
-    // Restore data sources
-    if (s.trainDataSources && s.trainDataSources.length) {
-      trainState.dataSources = s.trainDataSources;
-      renderTrainDataSources();
-    }
+    updatePoseDerivedDisplays();
   } catch { /* corrupted or unavailable */ }
 }
 
@@ -5055,6 +5162,7 @@ function updateProjectUI() {
     exportRltPkgBtn.classList.add("hidden");
   }
   renderTrainVideoChecklist();
+  renderPoseVideoChecklist();
   updateProjectGate();
 }
 
@@ -5292,7 +5400,7 @@ async function doExportRlt(pkg) {
     if (s.packaged) {
       setStatus(
         `Exported package .rlt: ${s.videos} video(s), ${s.labels} label set(s), ` +
-        `${s.frames} frames, ${s.backgrounds} backgrounds, ${s.checkpoints} checkpoints, ${s.exports} exports.`
+        `${s.pose} pose file(s), ${s.features} feature set(s), ${s.checkpoints} model(s).`
       );
     } else {
       setStatus(`Exported .rlt: ${s.videos} video reference(s), ${s.labels} label set(s).`);
