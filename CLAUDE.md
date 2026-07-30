@@ -142,6 +142,17 @@ trajectories are comparable with the reference Streamlit app.
 - **MKV / non-MP4 containers**: the frame-accurate WebCodecs path demuxes with
   mp4box (ISO/MP4 only), so other containers are remuxed to MP4 first. The pose
   file is unaffected — only the in-renderer decoder cares.
+- **On-video HUD**: `#videoHud` shows the current frame's predicted class, its
+  confidence, and the human label directly over the video ("Info overlay"
+  checkbox in the player controls). It's plain DOM, not canvas, so text stays
+  sharp at any video resolution and needs no letterbox coordinate mapping.
+  `currentFrameInfo()` is the single source for both it and the Active Learning
+  panel's text readout, so the two can't drift. Confidence is `1 - uncertainty`
+  (uncertainty being normalized entropy), and a red border flags a genuine
+  prediction/label disagreement. Every `alState` read in `currentFrameInfo()`
+  must stay inside its try/catch — `updateAlFrameInfo` runs during module
+  evaluation, before `const alState` is initialized, so an unguarded touch is a
+  TDZ crash that kills the whole renderer.
 - **Pose overlay**: drawn on its own `#poseCanvas` above both playback paths,
   in the pose file's native pixel coordinates on a canvas sized to the video's
   natural resolution, so `object-fit: contain` aligns it for free. Deliberately

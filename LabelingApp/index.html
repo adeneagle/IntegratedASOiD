@@ -82,6 +82,19 @@
             <!-- Pose skeleton overlay: sized to the video's natural resolution so
                  keypoints can be drawn in the pose file's own pixel coordinates. -->
             <canvas id="poseCanvas"></canvas>
+            <!-- On-video readout of this frame's prediction vs. its label -->
+            <div id="videoHud" class="video-hud">
+              <div class="hud-row hud-pred">
+                <span class="hud-key">Predicted</span>
+                <span class="hud-val" id="hudPred">&mdash;</span>
+                <span class="hud-conf" id="hudConf"></span>
+              </div>
+              <div class="hud-bar" id="hudBar"><div class="hud-bar-fill" id="hudBarFill"></div></div>
+              <div class="hud-row hud-label">
+                <span class="hud-key">Label</span>
+                <span class="hud-val" id="hudLabel">&mdash;</span>
+              </div>
+            </div>
           </div>
           <div class="controls">
             <button id="playPause">Play</button>
@@ -107,6 +120,10 @@
             <label class="pause-control">
               <input id="pauseOnLabelEnd" type="checkbox" />
               <span>Pause on label end</span>
+            </label>
+            <label class="pause-control">
+              <input id="showHud" type="checkbox" checked />
+              <span>Info overlay</span>
             </label>
             <label class="pause-control">
               <input id="showPoseOverlay" type="checkbox" />
