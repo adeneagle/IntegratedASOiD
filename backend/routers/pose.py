@@ -5,7 +5,7 @@ Replaces the TSM app's `preprocessing` router. Same task/SSE conventions.
 
 import asyncio
 import json
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -32,8 +32,8 @@ class InspectRequest(BaseModel):
 class KeypointsRequest(BaseModel):
     pose_path: str
     origin: str = "deeplabcut"
-    bodyparts: list[str]
-    animals: Optional[list[str]] = None
+    bodyparts: List[str]
+    animals: Optional[List[str]] = None
     multi_animal: bool = False
     start: int = 0
     end: Optional[int] = None
@@ -47,16 +47,16 @@ class VideoSource(BaseModel):
 
 class ExtractRequest(BaseModel):
     project_dir: str
-    videos: list[VideoSource]
+    videos: List[VideoSource]
     origin: str = "deeplabcut"
-    bodyparts: list[str]
+    bodyparts: List[str]
     framerate: float = 30.0
     min_duration: float = 0.1
     llh_value: float = 0.6
-    animals: Optional[list[str]] = None
+    animals: Optional[List[str]] = None
     multi_animal: bool = False
     iteration_dir: str = "iteration-0"
-    keep_classes: Optional[list[str]] = None
+    keep_classes: Optional[List[str]] = None
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────

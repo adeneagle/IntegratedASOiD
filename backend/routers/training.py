@@ -7,7 +7,7 @@ run is configured by four numbers instead of a deep-learning hyperparameter set.
 
 import asyncio
 import json
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -30,7 +30,7 @@ router = APIRouter()
 class TrainingConfig(BaseModel):
     # Data
     project_dir: str
-    video_ids: list[str]
+    video_ids: List[str]
     iteration_dir: str = "iteration-0"
 
     # Active learning
@@ -43,7 +43,7 @@ class TrainingConfig(BaseModel):
     # Optional label-space collapse (mirrors the TSM app's binarize semantics,
     # so the renderer's behavior checklist keeps working unchanged).
     binarize: Optional[str] = None
-    label_union: Optional[list[str]] = None
+    label_union: Optional[List[str]] = None
 
     # Output
     checkpoint_dir: Optional[str] = None
@@ -51,7 +51,7 @@ class TrainingConfig(BaseModel):
 
 
 class CheckpointSearchRequest(BaseModel):
-    search_dirs: Optional[list[str]] = None
+    search_dirs: Optional[List[str]] = None
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────

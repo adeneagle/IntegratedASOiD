@@ -8,7 +8,7 @@ params.
 
 import asyncio
 import json
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -30,9 +30,9 @@ class InferenceRequest(BaseModel):
     pose_path: str
     origin: str = "deeplabcut"
     # Defaults to the selection recorded on the checkpoint when omitted.
-    bodyparts: Optional[list[str]] = None
+    bodyparts: Optional[List[str]] = None
     llh_value: float = 0.6
-    animals: Optional[list[str]] = None
+    animals: Optional[List[str]] = None
     multi_animal: bool = False
     # Optional scoping: inclusive [start, end] native-index pairs.
     # Omit/None to run on the entire recording.
@@ -41,12 +41,12 @@ class InferenceRequest(BaseModel):
 
 class BatchInferenceRequest(BaseModel):
     checkpoint_path: str
-    pose_paths: list[str]
+    pose_paths: List[str]
     output_dir: str
     origin: str = "deeplabcut"
-    bodyparts: Optional[list[str]] = None
+    bodyparts: Optional[List[str]] = None
     llh_value: float = 0.6
-    animals: Optional[list[str]] = None
+    animals: Optional[List[str]] = None
     multi_animal: bool = False
 
 
