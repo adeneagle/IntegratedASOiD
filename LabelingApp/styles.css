@@ -389,6 +389,12 @@ video {
   display: none;
 }
 
+/* Pose/video frame-count mismatch — a silent-but-fatal misconfiguration. */
+.pose-warning {
+  color: #b45309;
+  font-weight: 600;
+}
+
 /* On-video HUD: this frame's prediction, its confidence, and the human label.
    Plain DOM rather than canvas so the text stays sharp at any video resolution
    and needs no letterbox coordinate mapping. pointer-events:none so it can

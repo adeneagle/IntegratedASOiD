@@ -99,6 +99,15 @@ valid for the exact selection it was trained on. Checkpoints carry a
 `bodypart_fingerprint`; `inference_service.check_bodyparts` rejects a mismatch
 loudly. (Upstream A-SOID hit this — commit 1710d15.)
 
+**Pose and video must cover the same frames.** Features, labels and predictions
+are all indexed by frame number with no offset, so attaching a pose file that
+tracks a longer recording than the loaded video (a full session's `.h5` against
+a short review clip) breaks silently: inference runs over the whole pose file
+and the uncertainty timeline squeezes hours into a few minutes of trackbar.
+`inspectPoseFile` warns on any length mismatch, "entire video" scope clamps to
+`videoFrameCount()`, and `restorePredictions` trims out-of-range frames from
+older saved prediction files (in memory only — the file keeps its full data).
+
 **Labels are sparse on disk, dense in training.** `generateTrainingLabelCsv`
 writes a row only for in-bout frames. `pose_service.dense_targets_from_csv`
 expands that to one class per frame with every unlabeled frame set to the *last*

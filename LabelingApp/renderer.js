@@ -3329,6 +3329,18 @@ function getVideoPath() {
   return currentFile && currentFile.path ? currentFile.path : null;
 }
 
+// How many frames the loaded video actually has. Everything the user reviews is
+// indexed against this, so it's the ceiling for anything worth predicting.
+// Returns 0 when unknown (no video loaded / duration not yet available).
+function videoFrameCount() {
+  if (webcodecsMode && webcodecsSamples.length) return webcodecsSamples.length;
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    const fps = Number(fpsInput.value) || 30;
+    return Math.round(video.duration * fps);
+  }
+  return 0;
+}
+
 const poseState = {
   origin: "deeplabcut",
   multiAnimal: false,
@@ -3476,11 +3488,39 @@ async function inspectPoseFile(posePath) {
   poseState.selected = new Set(poseState.bodyparts);
   poseState.selectedAnimals = new Set(poseState.animals);
 
-  poseEl("poseInfo").textContent =
+  const infoEl = poseEl("poseInfo");
+  infoEl.textContent =
     `${info.n_frames} frames · ${poseState.bodyparts.length} body parts` +
     (poseState.animals.length ? ` · ${poseState.animals.length} animals` : "") +
     (info.is_3d ? " · 3D" : "") +
     (info.has_likelihood ? "" : " · no likelihood column");
+
+  // A pose file that doesn't cover the same frames as the video is the single
+  // most damaging mistake here, and it fails *silently*: features, labels and
+  // predictions are all indexed by frame number, so a 4-hour pose file attached
+  // to a 6-minute clip yields predictions running 40x past the end of the video.
+  // The uncertainty timeline then compresses the whole recording into the
+  // visible clip and "jump to lowest confidence" seeks off the end.
+  const vFrames = videoFrameCount();
+  poseState.frameMismatch = null;
+  if (vFrames > 0 && info.n_frames > 0) {
+    const ratio = info.n_frames / vFrames;
+    if (ratio > 1.02 || ratio < 0.98) {
+      poseState.frameMismatch = { poseFrames: info.n_frames, videoFrames: vFrames };
+      infoEl.textContent +=
+        `  ⚠ the video has ${vFrames} frames — this pose file covers ` +
+        `${ratio > 1 ? `${ratio.toFixed(1)}x more` : `only ${(ratio * 100).toFixed(0)}%`}. ` +
+        `They must describe the same recording, aligned from frame 0.`;
+      infoEl.classList.add("pose-warning");
+      setStatus(
+        `Pose/video length mismatch: pose has ${info.n_frames} frames, video has ${vFrames}.`
+      );
+    } else {
+      infoEl.classList.remove("pose-warning");
+    }
+  } else {
+    infoEl.classList.remove("pose-warning");
+  }
 
   renderPoseAnimalList();
   renderPoseBodypartList();
@@ -4557,9 +4597,34 @@ async function restorePredictions(videoName) {
     if (currentVideoName !== videoName) return; // user switched videos meanwhile
     const results = JSON.parse(content);
     if (!results || !Array.isArray(results.frames)) return;
+
+    // Predictions saved before the frame-range clamp (or from a pose file longer
+    // than the video) can run far past the last frame. Trim them for display so
+    // the uncertainty timeline stays aligned with the trackbar. Done in memory
+    // only — the file on disk is left intact, since those extra predictions are
+    // still valid for the part of the recording this clip was cut from.
+    const vFrames = videoFrameCount();
+    let trimmed = 0;
+    if (vFrames > 0 && results.frames.length) {
+      const kept = results.frames.filter((f) => f.index < vFrames);
+      trimmed = results.frames.length - kept.length;
+      if (trimmed > 0) results.frames = kept;
+    }
+
     applyAlResults(results);
     const statusEl = document.getElementById("alStatus");
-    if (statusEl) statusEl.textContent = `Loaded saved predictions: ${results.frames.length} frames`;
+    if (statusEl) {
+      statusEl.textContent = trimmed > 0
+        ? `Loaded saved predictions: ${results.frames.length} frames ` +
+          `(${trimmed} beyond the end of the video ignored)`
+        : `Loaded saved predictions: ${results.frames.length} frames`;
+    }
+    if (trimmed > 0) {
+      setStatus(
+        `${trimmed} saved predictions fall past the end of this video — ` +
+        `the pose file likely covers a longer recording.`
+      );
+    }
   } catch (e) {
     console.warn("[al] Failed to restore predictions", e);
   }
@@ -4665,7 +4730,14 @@ document.getElementById("alRangeEndCur").addEventListener("click", () => {
 // inclusive [start, end] pairs, or { error } if the selection is invalid.
 function resolveAlFrameRanges() {
   const scope = alScopeSelect.value;
-  if (scope === "all") return { ranges: null };
+  if (scope === "all") {
+    // "Entire video" means exactly that — not the entire *pose file*, which may
+    // be much longer (a full session's tracking against a short review clip).
+    // Bounding it here keeps the uncertainty timeline aligned with the trackbar
+    // and stops inference spending minutes on frames that can't be looked at.
+    const vFrames = videoFrameCount();
+    return { ranges: vFrames > 0 ? [[0, vFrames - 1]] : null };
+  }
 
   if (scope === "range") {
     const start = parseInt(document.getElementById("alRangeStart").value, 10);
