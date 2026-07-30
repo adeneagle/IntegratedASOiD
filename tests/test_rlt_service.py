@@ -161,6 +161,27 @@ def test_package_round_trip_restores_models_and_predictions(sample_project, tmp_
     assert (dest / "predictions" / "vid_a.json").exists()
 
 
+def test_iteration_scoped_models_round_trip(sample_project, tmp_path):
+    """A model saved under iteration-N/models must come back in the same place."""
+    project_dir, _ = sample_project
+    it_models = Path(project_dir, "iteration-0", "models")
+    it_models.mkdir(parents=True)
+    (it_models / "rf_it0.joblib").write_bytes(b"\x01" * 256)
+
+    out = str(tmp_path / "pkg.rlt")
+    summary = export_rlt(project_dir, out, package=True)
+    # The iteration model plus the legacy flat one in the fixture.
+    assert summary["checkpoints"] == 2
+
+    dest = tmp_path / "restored"
+    import_rlt(out, str(dest))
+    restored = dest / "iteration-0" / "models" / "rf_it0.joblib"
+    assert restored.exists()
+    assert restored.read_bytes() == b"\x01" * 256
+    # And the legacy one stays where it was.
+    assert (dest / "models" / "checkpoints" / "rf_model.joblib").exists()
+
+
 def test_multiple_iterations_are_all_packed(sample_project, tmp_path):
     project_dir, _ = sample_project
     # Add a second iteration.

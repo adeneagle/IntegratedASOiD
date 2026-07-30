@@ -168,6 +168,56 @@ def test_list_checkpoints_ignores_missing_dirs():
     assert training_service.list_checkpoints(["/no/such/dir"]) == []
 
 
+def test_model_is_saved_inside_its_iteration(extracted_project):
+    """Models belong to the iteration whose features trained them, so 'which is
+    newest and what was it trained on' is answerable from the layout alone."""
+    task_id, status = _train(extracted_project, checkpoint_dir=None)
+    task = training_service.get_task(task_id)
+    assert status == "completed", task.get("error")
+    ckpt = task["checkpoint_path"]
+    assert os.path.join("iteration-0", "models") in ckpt, ckpt
+
+    bundle = joblib.load(ckpt)
+    assert bundle["iteration"] == "iteration-0"
+    assert bundle["video_ids"] == ["vid1"]
+    assert bundle["trained_at"]
+
+
+def test_checkpoints_are_listed_newest_first_with_iteration(extracted_project):
+    import shutil
+
+    # Train once into iteration-0, then again into iteration-1.
+    _train(extracted_project, checkpoint_dir=None, model_name="older")
+    shutil.copytree(
+        os.path.join(extracted_project, "iteration-0"),
+        os.path.join(extracted_project, "iteration-1"),
+    )
+    task_id, status = _train(
+        extracted_project, iteration_dir="iteration-1",
+        checkpoint_dir=None, model_name="newer",
+    )
+    assert status == "completed", training_service.get_task(task_id).get("error")
+
+    found = training_service.list_checkpoints([extracted_project])
+    assert len(found) >= 2
+    # Newest first, and each knows which iteration it came from.
+    assert found[0]["filename"].startswith("newer")
+    assert found[0]["iteration"] == "iteration-1"
+    assert any(e["iteration"] == "iteration-0" for e in found)
+    assert all("modified" in e for e in found)
+
+
+def test_list_checkpoints_still_finds_legacy_flat_models(tmp_path):
+    """Projects created before models moved into iterations must still work."""
+    legacy = tmp_path / "models" / "checkpoints"
+    legacy.mkdir(parents=True)
+    joblib.dump({"model": None, "class_names": ["a"]}, legacy / "old.joblib")
+    found = training_service.list_checkpoints([str(tmp_path)])
+    assert len(found) == 1
+    assert found[0]["filename"] == "old.joblib"
+    assert found[0]["iteration"] is None
+
+
 def test_collapse_labels_is_a_noop_without_binarize():
     y = np.array([0, 1, 2])
     names = ["a", "b", "other"]

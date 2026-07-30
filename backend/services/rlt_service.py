@@ -156,16 +156,29 @@ def export_rlt(
                 _report("predictions", (i + 1) / max(len(preds), 1) * 100)
 
         # ── Models (package only) ─────────────────────────────────────
+        # Models live under the iteration that produced them; the older flat
+        # models/checkpoints/ layout is still collected so existing projects
+        # round-trip. Dataset names keep the iteration prefix so import can put
+        # each model back where it belongs.
         models_grp = hf.create_group("models")
         ckpt_grp = models_grp.create_group("checkpoints")
-        mdir = project_dir / "models" / "checkpoints"
-        if mdir.is_dir():
-            files = sorted(p for p in mdir.glob("*.joblib") if p.is_file())
-            for i, f in enumerate(files):
-                raw = np.frombuffer(f.read_bytes(), dtype=np.uint8)
-                ckpt_grp.create_dataset(f.name, data=raw, compression="gzip", compression_opts=4)
-                summary["checkpoints"] += 1
-                _report("models", (i + 1) / max(len(files), 1) * 100)
+        model_files = []
+        for idir in sorted(project_dir.glob("iteration-*")):
+            mdir = idir / "models"
+            if mdir.is_dir():
+                model_files += [(idir.name, p) for p in sorted(mdir.glob("*.joblib"))]
+        legacy = project_dir / "models" / "checkpoints"
+        if legacy.is_dir():
+            model_files += [(None, p) for p in sorted(legacy.glob("*.joblib"))]
+
+        for i, (iter_name, f) in enumerate(model_files):
+            raw = np.frombuffer(f.read_bytes(), dtype=np.uint8)
+            key = f"{iter_name}__{f.name}" if iter_name else f.name
+            ds = ckpt_grp.create_dataset(key, data=raw, compression="gzip", compression_opts=4)
+            if iter_name:
+                ds.attrs["iteration"] = iter_name
+            summary["checkpoints"] += 1
+            _report("models", (i + 1) / max(len(model_files), 1) * 100)
 
         _report("done", 100)
 
@@ -268,13 +281,21 @@ def import_rlt(
                 (pred_dir / f"{vid_id}.json").write_text(content, encoding="utf-8")
             _report("predictions", 100)
 
-        # Models (package)
+        # Models (package) — restored into the iteration they came from.
         if "models" in hf and "checkpoints" in hf["models"]:
-            dest_dir = output_dir / "models" / "checkpoints"
-            dest_dir.mkdir(parents=True, exist_ok=True)
             for name in hf["models"]["checkpoints"].keys():
-                data = hf["models"]["checkpoints"][name][()]
-                (dest_dir / name).write_bytes(data.tobytes())
+                ds = hf["models"]["checkpoints"][name]
+                iter_name = ds.attrs.get("iteration")
+                if isinstance(iter_name, bytes):
+                    iter_name = iter_name.decode("utf-8")
+                if iter_name:
+                    dest_dir = output_dir / iter_name / "models"
+                    filename = name.split("__", 1)[-1]
+                else:
+                    dest_dir = output_dir / "models" / "checkpoints"
+                    filename = name
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / filename).write_bytes(ds[()].tobytes())
             _report("models", 100)
 
         (output_dir / "project.json").write_text(

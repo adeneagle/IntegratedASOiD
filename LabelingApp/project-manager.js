@@ -353,6 +353,51 @@
     return activeProject.rootDir + "/models/checkpoints";
   }
 
+  // ── Iterations ────────────────────────────────────────────────────────────
+  // An iteration is one full pass of the loop: the labels as they stood, the
+  // features extracted from them, and the model trained on those features. They
+  // are kept together under iteration-N/ so "which model is newest, and what was
+  // it trained on?" is answerable from the directory layout alone.
+
+  function getCurrentIteration() {
+    if (!activeProject) return 0;
+    const n = activeProject.manifest.current_iteration;
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  function setCurrentIteration(n) {
+    if (!activeProject || !Number.isFinite(n) || n < 0) return;
+    activeProject.manifest.current_iteration = n;
+    saveManifest();
+  }
+
+  function iterationName(n) {
+    return "iteration-" + (Number.isFinite(n) ? n : getCurrentIteration());
+  }
+
+  function getIterationModelsDir(iterName) {
+    if (!activeProject) return null;
+    return activeProject.rootDir + "/" + (iterName || iterationName()) + "/models";
+  }
+
+  // Per-iteration bookkeeping: what the labels looked like when its features
+  // were built, so the app can tell whether new labeling has happened since.
+  function getIterationMeta(iterName) {
+    if (!activeProject) return null;
+    const all = activeProject.manifest.iterations;
+    return (all && all[iterName]) || null;
+  }
+
+  function setIterationMeta(iterName, meta) {
+    if (!activeProject) return;
+    if (!activeProject.manifest.iterations) activeProject.manifest.iterations = {};
+    activeProject.manifest.iterations[iterName] = {
+      ...(activeProject.manifest.iterations[iterName] || {}),
+      ...meta,
+    };
+    saveManifest();
+  }
+
   function getExportsDir() {
     if (!activeProject) return null;
     return activeProject.rootDir + "/models/exports";
@@ -490,6 +535,12 @@
     // Paths
     getModelsDir,
     getCheckpointsDir,
+    getCurrentIteration,
+    setCurrentIteration,
+    iterationName,
+    getIterationModelsDir,
+    getIterationMeta,
+    setIterationMeta,
     getExportsDir,
     setVideoPreprocessing,
     getVideoPreprocessing,

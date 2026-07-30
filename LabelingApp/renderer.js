@@ -3687,10 +3687,19 @@ poseEl("poseExtract").addEventListener("click", async () => {
       || pm.getVideoFrameCount(name) || null,
   }));
 
+  // Roll onto a new iteration if labeling has moved on since this one was built.
+  const { iterationDir, advanced, signature } = autoAdvanceIteration(names);
+
   poseEl("poseLog").textContent = "";
   poseEl("poseExtract").disabled = true;
   poseEl("poseStopExtract").disabled = false;
   poseEl("poseStatus").textContent = "Starting...";
+  if (advanced) {
+    poseLog(`Labels changed since the last extraction — starting ${iterationDir}.`);
+    setStatus(`New labels detected: starting ${iterationDir}.`);
+  } else {
+    poseLog(`Extracting into ${iterationDir}.`);
+  }
 
   const params = {
     project_dir: pm.getProjectRoot(),
@@ -3702,7 +3711,7 @@ poseEl("poseExtract").addEventListener("click", async () => {
     llh_value: parseFloat(poseEl("poseLlh").value) || 0.6,
     animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
     multi_animal: poseState.multiAnimal,
-    iteration_dir: currentIterationDir(),
+    iteration_dir: iterationDir,
   };
 
   // Persist the settings that produced these features, so reopening the project
@@ -3761,7 +3770,20 @@ poseEl("poseExtract").addEventListener("click", async () => {
                         `were below the likelihood threshold — check tracking quality.`);
               }
             }
-            poseEl("poseStatus").textContent = `Done: ${results.videos.length} video(s)`;
+            // Record what the labels looked like for this iteration, so the next
+            // extraction can tell whether new labeling has happened since.
+            try {
+              pm.setIterationMeta(iterationDir, {
+                label_signature: signature,
+                extracted_at: new Date().toISOString(),
+                videos: results.videos.map((v) => v.id),
+                class_names: results.class_names,
+                n_rows: results.videos.reduce((n, v) => n + v.n_rows, 0),
+              });
+              pm.setCurrentIteration(parseInt(poseEl("poseIteration").value, 10) || 0);
+            } catch { /* manifest not ready */ }
+            poseEl("poseStatus").textContent =
+              `Done: ${results.videos.length} video(s) in ${iterationDir}`;
             renderTrainVideoChecklist();
           } catch (e) {
             poseEl("poseStatus").textContent = `Error fetching results: ${e.message}`;
@@ -3804,6 +3826,63 @@ poseEl("poseStopExtract").addEventListener("click", async () => {
 function currentIterationDir() {
   const n = parseInt(poseEl("poseIteration").value, 10);
   return `iteration-${Number.isFinite(n) && n >= 0 ? n : 0}`;
+}
+
+// A cheap fingerprint of the labels feeding an iteration. Changes whenever a
+// bout is added, removed, retimed or relabeled on any selected video, which is
+// exactly "a new set of frames has been labeled".
+function labelSignature(videoNames) {
+  const parts = [];
+  for (const name of [...videoNames].sort()) {
+    // The current video's in-memory bouts are newer than its stored copy.
+    const vb = name === currentVideoName ? bouts : (loadProgress(name)?.bouts || []);
+    const frames = vb.reduce((n, b) => n + (b.endFrame - b.startFrame + 1), 0);
+    const spans = vb
+      .map((b) => `${b.startFrame}-${b.endFrame}:${b.behaviorName}`)
+      .sort()
+      .join(",");
+    parts.push(`${name}|${vb.length}|${frames}|${hashString(spans)}`);
+  }
+  return parts.join(";");
+}
+
+// Small non-cryptographic string hash (FNV-1a) — this only needs to change when
+// the labels change, not to resist anything.
+function hashString(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+
+// Advance to a fresh iteration when the labels have moved on since the current
+// one was extracted. Without this the iteration counter is decorative: every
+// re-extraction overwrites the previous round's features and models, and there
+// is no way to tell which model came from which labeling effort.
+function autoAdvanceIteration(videoNames) {
+  const pm = window.projectManager;
+  if (!pm || !pm.isActive()) return { iterationDir: currentIterationDir(), advanced: false };
+
+  const iterationDir = currentIterationDir();
+  const meta = pm.getIterationMeta(iterationDir);
+  const signature = labelSignature(videoNames);
+
+  // Nothing extracted here yet → this iteration is still fresh, keep using it.
+  if (!meta || !meta.label_signature) {
+    return { iterationDir, advanced: false, signature };
+  }
+  // Same labels as last time → re-extracting is a redo, not a new round.
+  if (meta.label_signature === signature) {
+    return { iterationDir, advanced: false, signature };
+  }
+
+  const next = pm.getCurrentIteration() + 1;
+  pm.setCurrentIteration(next);
+  poseEl("poseIteration").value = next;
+  poseState.extractedVideos.clear();
+  return { iterationDir: pm.iterationName(next), advanced: true, signature };
 }
 
 poseEl("poseNewIteration").addEventListener("click", async () => {
@@ -4122,7 +4201,8 @@ document.getElementById("trainStart").addEventListener("click", async () => {
     exclude_other: document.getElementById("trainExcludeOther").checked,
     binarize: positives.length === 1 ? positives[0] : null,
     label_union: positives.length > 1 ? positives : null,
-    checkpoint_dir: pm.getCheckpointsDir(),
+    // Save the model beside the features it was trained on.
+    checkpoint_dir: pm.getIterationModelsDir(currentIterationDir()),
     model_name: document.getElementById("trainModelName").value || "rf_model",
   };
 
@@ -4160,12 +4240,14 @@ document.getElementById("trainStart").addEventListener("click", async () => {
                 name: data.checkpoint_path.split(/[\\/]/).pop(),
                 path: data.checkpoint_path,
                 created: new Date().toISOString().slice(0, 10),
+                iteration: config.iteration_dir,
+                macro_f1: data.macro_f1,
                 source: "trained",
                 config,
               });
             } catch { /* manifest not ready */ }
             alState.checkpointPath = data.checkpoint_path;
-            setPathDisplay("alCheckpointPath", data.checkpoint_path);
+            setAlCheckpointDisplay(data.checkpoint_path, config.iteration_dir);
             trainLog(`checkpoint: ${data.checkpoint_path}`);
           }
         } else if (data.status === "error" || data.status === "cancelled") {
@@ -4707,6 +4789,49 @@ document.getElementById("alShowTimeline").addEventListener("change", () => {
   renderUncertaintyOverlay();
 });
 
+// Show which iteration a model came from — the thing that actually tells you
+// how recent it is — rather than just a bare path.
+function setAlCheckpointDisplay(path, iteration) {
+  const el = document.getElementById("alCheckpointPath");
+  if (!el) return;
+  const iter = iteration || (path.match(/iteration-\d+/) || [])[0];
+  const name = path.split(/[\\/]/).pop();
+  el.textContent = iter ? `${name}  (${iter})` : name;
+  el.title = path;
+}
+
+// Pick the most recently trained model in the project, so the Active Learning
+// tab defaults to the newest rather than whatever was selected last.
+async function selectNewestCheckpoint({ silent = false } = {}) {
+  const pm = window.projectManager;
+  if (!pm || !pm.isActive()) return null;
+  try {
+    const res = await backendFetch(
+      `/api/training/checkpoints?search_dirs=${encodeURIComponent(pm.getProjectRoot())}`
+    );
+    const newest = (res.checkpoints || [])[0];   // backend sorts newest first
+    if (!newest) return null;
+    alState.checkpointPath = newest.path;
+    setAlCheckpointDisplay(newest.path, newest.iteration);
+    if (!silent) {
+      setStatus(
+        `Using newest model: ${newest.filename}` +
+        (newest.iteration ? ` from ${newest.iteration}` : "") +
+        (newest.macro_f1 ? ` (macro F1 ${newest.macro_f1.toFixed(3)})` : "")
+      );
+    }
+    return newest;
+  } catch {
+    return null;   // backend down — leave whatever was selected
+  }
+}
+
+document.getElementById("alUseNewest").addEventListener("click", () => {
+  selectNewestCheckpoint().then((m) => {
+    if (!m) setStatus("No trained models found in this project yet.");
+  });
+});
+
 // Select checkpoint
 document.getElementById("alSelectCheckpoint").addEventListener("click", async () => {
   if (!window.api) return;
@@ -4716,7 +4841,7 @@ document.getElementById("alSelectCheckpoint").addEventListener("click", async ()
   });
   if (!res.canceled) {
     alState.checkpointPath = res.path;
-    setPathDisplay("alCheckpointPath", res.path);
+    setAlCheckpointDisplay(res.path);
     // Record manually-selected checkpoints in the project manifest too.
     if (window.projectManager && window.projectManager.isActive()) {
       window.projectManager.addModel({
@@ -5347,7 +5472,7 @@ function loadSettings() {
     if (s.alMinSegment !== undefined) alMinSegmentInput.value = s.alMinSegment;
     if (s.lastCheckpointPath) {
       alState.checkpointPath = s.lastCheckpointPath;
-      setPathDisplay("alCheckpointPath", s.lastCheckpointPath);
+      setAlCheckpointDisplay(s.lastCheckpointPath);
     }
 
     // Layout
@@ -5487,6 +5612,15 @@ function updateProjectUI() {
   }
   renderTrainVideoChecklist();
   renderPoseVideoChecklist();
+  // The iteration belongs to the project, not the session — restore it so
+  // reopening doesn't silently start writing over iteration-0 again.
+  try {
+    const pm = window.projectManager;
+    if (pm && pm.isActive()) {
+      poseEl("poseIteration").value = pm.getCurrentIteration();
+      selectNewestCheckpoint({ silent: true });
+    }
+  } catch { /* pose panel not initialized yet */ }
   updateProjectGate();
 }
 
@@ -5590,15 +5724,15 @@ async function relinkProjectModels(manifest) {
     );
     if (!ok) continue;
     const res = await window.api.selectFile({
-      title: `Locate checkpoint for "${m.name}"`,
-      filters: [{ name: "Checkpoints", extensions: ["ckpt", "pt"] }],
+      title: `Locate model for "${m.name}"`,
+      filters: [{ name: "Models", extensions: ["joblib"] }],
     });
     if (res && !res.canceled) {
       window.projectManager.updateModelPath(m.path, res.path);
       // If this is the model the Active Learning panel points at, update it.
       if (alState && alState.checkpointPath === m.path) {
         alState.checkpointPath = res.path;
-        setPathDisplay("alCheckpointPath", res.path);
+        setAlCheckpointDisplay(res.path, m.iteration);
       }
       setStatus(`Re-linked model "${m.name}".`);
     }

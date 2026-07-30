@@ -196,10 +196,27 @@ trajectories are comparable with the reference Streamlit app.
 my_experiment/
 ├── project.json              # manifest (videos, pose paths, behaviors, config)
 ├── labels/                   # frame-indexed one-hot label CSVs per video
-├── iteration-N/features/     # extracted features (.npz) per video
-├── predictions/              # saved AL inference results (.json)
-└── models/checkpoints/       # trained models (.joblib)
+├── iteration-N/
+│   ├── features/             # extracted features (.npz) per video
+│   └── models/               # models trained from those features (.joblib)
+└── predictions/              # saved AL inference results (.json)
 ```
+
+**Iterations are the unit of "one pass round the loop"** — the labels as they
+stood, the features built from them, and the model trained on those features,
+kept together so *which model is newest, and what was it trained on* is
+answerable from the layout. `autoAdvanceIteration()` bumps to a new one when
+Extract Features runs and `labelSignature()` differs from the signature stored
+on the current iteration (bout count, covered frames, and a hash of
+span+behavior — so retiming or renaming counts, not just adding). Re-extracting
+with unchanged labels is treated as a redo and stays put. The active iteration
+lives on the manifest (`current_iteration`), so reopening a project doesn't
+start overwriting `iteration-0`.
+
+Checkpoints record their `iteration`, `trained_at` and `video_ids`;
+`list_checkpoints` walks recursively (so pre-iteration `models/checkpoints/`
+models are still found), reports the iteration, and sorts newest first. "Use
+newest" in the Active Learning tab takes the top of that list.
 
 Video and pose paths are **absolute** (files stay where they are); everything
 else is relative to the project root.

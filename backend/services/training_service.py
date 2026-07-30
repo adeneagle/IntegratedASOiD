@@ -19,6 +19,7 @@ import os
 import tempfile
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -61,9 +62,14 @@ def start_training(config: dict) -> str:
     """
     task_id = str(uuid.uuid4())
 
+    # Models live inside the iteration that produced them. An iteration is a
+    # snapshot of (labels -> features -> model), so keeping the model beside the
+    # features it was trained on is what makes "which model is newest, and what
+    # was it trained on?" answerable at all.
+    iteration_dir = config.get("iteration_dir", "iteration-0")
     checkpoint_dir = config.get("checkpoint_dir") or os.path.join(
         config.get("project_dir", tempfile.mkdtemp(prefix="asoid_train_")),
-        "models", "checkpoints",
+        iteration_dir, "models",
     )
     tmp_dir = tempfile.mkdtemp(prefix="asoid_train_")
     metrics_path = os.path.join(tmp_dir, "metrics.jsonl")
@@ -151,13 +157,18 @@ def start_training(config: dict) -> str:
             os.makedirs(checkpoint_dir, exist_ok=True)
             best_macro = result.iterations[-1].macro_f1 if result.iterations else 0.0
             name = config.get("model_name") or "rf_model"
-            # Self-describing filename, matching the convention the TSM app used.
-            filename = f"{name}_f1{best_macro:.3f}_it{len(result.iterations)}.joblib"
+            # Self-describing filename. `it` is the active-learning round count
+            # within this run, not the project iteration — the project iteration
+            # is the directory the file sits in, and is recorded in the bundle.
+            filename = f"{name}_f1{best_macro:.3f}_al{len(result.iterations)}.joblib"
             checkpoint_path = os.path.join(checkpoint_dir, filename)
 
             joblib.dump({
                 "model": result.model,
                 "class_names": result.class_names,
+                "iteration": iteration_dir,
+                "trained_at": datetime.now().isoformat(timespec="seconds"),
+                "video_ids": list(config["video_ids"]),
                 "bodyparts": meta["bodyparts"],
                 "bodypart_fingerprint": fingerprint_bodyparts(
                     meta["bodyparts"], meta["is_3d"]
@@ -291,11 +302,16 @@ def stop_training(task_id: str) -> bool:
 
 
 def list_checkpoints(search_dirs: list[str] | None = None) -> list[dict]:
-    """Scan directories for saved models. Returns [{path, filename, size_mb, ...}]."""
+    """Scan directories for saved models, newest first.
+
+    Walks recursively, so it finds both the current `iteration-N/models/` layout
+    and models left in the older flat `models/checkpoints/` directory.
+    """
     if search_dirs is None:
         search_dirs = [PROJECT_ROOT]
 
     results = []
+    seen = set()
     for base_dir in search_dirs:
         if not base_dir or not os.path.isdir(base_dir):
             continue
@@ -304,10 +320,19 @@ def list_checkpoints(search_dirs: list[str] | None = None) -> list[dict]:
                 if not f.endswith(".joblib"):
                     continue
                 full_path = os.path.join(root, f)
+                if full_path in seen:
+                    continue
+                seen.add(full_path)
+                mtime = os.path.getmtime(full_path)
                 entry = {
                     "path": full_path,
                     "filename": f,
                     "size_mb": round(os.path.getsize(full_path) / (1024 * 1024), 1),
+                    "modified": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+                    "_mtime": mtime,
+                    # Fall back to the containing directory for models saved
+                    # before the iteration was recorded in the bundle.
+                    "iteration": _iteration_from_path(full_path),
                 }
                 # Surface the metadata the UI needs to warn about a mismatched
                 # body-part selection without the user opening the file.
@@ -318,8 +343,25 @@ def list_checkpoints(search_dirs: list[str] | None = None) -> list[dict]:
                         "bodyparts": bundle.get("bodyparts"),
                         "macro_f1": bundle.get("macro_f1"),
                         "frames2integ": bundle.get("frames2integ"),
+                        "video_ids": bundle.get("video_ids"),
+                        "trained_at": bundle.get("trained_at"),
                     })
+                    if bundle.get("iteration"):
+                        entry["iteration"] = bundle["iteration"]
                 except Exception:
                     pass
                 results.append(entry)
+
+    # Newest first, so "which one do I use?" needs no filename archaeology.
+    results.sort(key=lambda e: e["_mtime"], reverse=True)
+    for e in results:
+        e.pop("_mtime", None)
     return results
+
+
+def _iteration_from_path(path: str) -> Optional[str]:
+    """Infer `iteration-N` from a checkpoint's location, if it sits under one."""
+    for part in os.path.normpath(path).split(os.sep):
+        if part.startswith("iteration-"):
+            return part
+    return None
