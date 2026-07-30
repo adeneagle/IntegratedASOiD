@@ -146,6 +146,19 @@ trajectories are comparable with the reference Streamlit app.
   in the pose file's native pixel coordinates on a canvas sized to the video's
   natural resolution, so `object-fit: contain` aligns it for free. Deliberately
   shows *unfiltered* keypoints — the point is to reveal where tracking failed.
+  Toggle it with the "Pose overlay" checkbox in the player controls, next to
+  "Pause on label end". The redraw loop (`poseOverlayTick`) fires on a frame
+  change *or* a canvas-size change, not frame change alone — otherwise
+  toggling it on a paused, freshly-loaded video (before its true dimensions are
+  known) can leave a wrong-sized, misaligned overlay stuck until the user scrubs.
+- **Frame rate is read from the video, not typed in.** `#poseFramerate` mirrors
+  the player's `#fpsInput` (auto-detected from the video's own container timing
+  in WebCodecs mode, e.g. mp4box sample timescale/duration) via
+  `syncPoseFramerateFromVideo()`, called on every video load. It stops
+  overwriting the field the moment the user edits it directly
+  (`poseState.framerateManual`, persisted across sessions) — pose is estimated
+  on the same video, so a manual number is only needed if the pose file used a
+  different (typically subsampled) rate.
 
 ## Project Directory Structure
 

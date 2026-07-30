@@ -213,10 +213,12 @@
                 <label><span>Frame rate (fps):</span>
                   <input id="poseFramerate" type="number" min="1" max="240" step="0.1" value="30" />
                 </label>
+                <button id="poseUseVideoFps" class="ghost" title="Reset to the video's detected frame rate">Use video FPS</button>
                 <label><span>Likelihood threshold:</span>
                   <input id="poseLlh" type="number" min="0" max="1" step="0.05" value="0.6" />
                 </label>
               </div>
+              <p class="hint">Frame rate is read from the loaded video (WebCodecs mode detects it from the file's own container timing — see FPS in the player controls) and kept in sync here automatically. Edit it directly only if the pose file was estimated at a different rate than the video.</p>
               <div class="form-row">
                 <label><span>Min behavior duration (s):</span>
                   <input id="poseMinDuration" type="number" min="0.05" max="5" step="0.05" value="0.1" />

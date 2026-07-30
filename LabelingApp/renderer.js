@@ -3269,6 +3269,10 @@ const poseState = {
   // Overlay
   keypoints: null,          // { bodyparts, points: [{name,x[],y[],likelihood[]}] }
   keypointsVideo: null,     // which video `keypoints` belongs to
+  // FPS: mirrors the player's #fpsInput (auto-detected from the video's own
+  // container timing in WebCodecs mode) until the user edits this field
+  // directly, since the pose file was estimated on this same video.
+  framerateManual: false,
 };
 
 const poseEl = (id) => document.getElementById(id);
@@ -3459,7 +3463,33 @@ poseEl("poseSelectNoneBp").addEventListener("click", () => {
   renderPoseBodypartList();
   invalidatePoseOverlay();
 });
-poseEl("poseFramerate").addEventListener("input", updatePoseDerivedDisplays);
+// Frame rate is read from the video, not typed in: the player's #fpsInput is
+// already the app's single source of truth for it (auto-detected from the
+// container's own timing in WebCodecs mode, e.g. 29.970 for NTSC-derived
+// footage, and user-correctable there via FPS/Lock if detection is ever wrong).
+// The pose file is estimated on this same video, so mirror that value here
+// rather than asking the user to re-enter a number the app already knows —
+// unless they've deliberately typed a different one into this field (rare:
+// pose estimated at a subsampled rate), in which case stop overwriting it.
+function syncPoseFramerateFromVideo() {
+  if (poseState.framerateManual) return;
+  const detected = parseFloat(fpsInput.value);
+  if (Number.isFinite(detected) && detected > 0) {
+    poseEl("poseFramerate").value = detected.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+    updatePoseDerivedDisplays();
+  }
+}
+
+poseEl("poseFramerate").addEventListener("input", () => {
+  poseState.framerateManual = true;
+  updatePoseDerivedDisplays();
+});
+poseEl("poseUseVideoFps").addEventListener("click", () => {
+  poseState.framerateManual = false;
+  syncPoseFramerateFromVideo();
+  setStatus(`Frame rate reset to the video's detected ${poseEl("poseFramerate").value} fps.`);
+});
+fpsInput.addEventListener("input", syncPoseFramerateFromVideo);
 poseEl("poseMinDuration").addEventListener("input", updatePoseDerivedDisplays);
 
 // Videos eligible for extraction: those with a pose file attached.
@@ -3669,11 +3699,16 @@ const poseCanvas = document.getElementById("poseCanvas");
 const poseCtx = poseCanvas ? poseCanvas.getContext("2d") : null;
 let poseOverlayRaf = null;
 let poseOverlayLastFrame = -1;
+// Tracks the video/canvas size the overlay was last drawn at (see
+// poseOverlayTick) so a size change forces a redraw even on a paused video,
+// where currentFrameIndex alone wouldn't change.
+let poseOverlayLastSize = "";
 
 function invalidatePoseOverlay() {
   poseState.keypoints = null;
   poseState.keypointsVideo = null;
   poseOverlayLastFrame = -1;
+  poseOverlayLastSize = "";
 }
 
 async function ensurePoseKeypoints() {
@@ -3762,8 +3797,18 @@ function drawPoseOverlay() {
 
 function poseOverlayTick() {
   if (!poseEl("showPoseOverlay").checked) { poseOverlayRaf = null; return; }
-  if (currentFrameIndex !== poseOverlayLastFrame) {
+  // Redraw on a frame change, OR when the video's dimensions have just become
+  // known/changed — e.g. the overlay was toggled on before a freshly loaded,
+  // paused video finished decoding its first frame. Without the size check,
+  // that single early draw could land on a wrong-sized canvas and then never
+  // redraw again (currentFrameIndex isn't changing on a paused video), leaving
+  // a misaligned overlay until the user scrubs.
+  const w = video.videoWidth || videoCanvas.width || 0;
+  const h = video.videoHeight || videoCanvas.height || 0;
+  const sizeKey = `${w}x${h}`;
+  if (currentFrameIndex !== poseOverlayLastFrame || sizeKey !== poseOverlayLastSize) {
     poseOverlayLastFrame = currentFrameIndex;
+    poseOverlayLastSize = sizeKey;
     drawPoseOverlay();
   }
   poseOverlayRaf = requestAnimationFrame(poseOverlayTick);
@@ -3786,12 +3831,14 @@ poseEl("showPoseOverlay").addEventListener("change", async () => {
   }
   poseCanvas.style.display = "block";
   poseOverlayLastFrame = -1;
+  poseOverlayLastSize = "";
   if (!poseOverlayRaf) poseOverlayTick();
 });
 
 // Called on video switch so one video's pose never draws over another.
 function resetPoseForVideo() {
   invalidatePoseOverlay();
+  syncPoseFramerateFromVideo();
   const p = getPosePathFor(currentVideoName);
   setPathDisplay("posePath", p || "No pose file for this video");
   if (poseCanvas && poseEl("showPoseOverlay").checked) {
@@ -3802,6 +3849,7 @@ function resetPoseForVideo() {
         poseCanvas.style.display = "none";
       } else {
         poseOverlayLastFrame = -1;
+        poseOverlayLastSize = "";
       }
     });
   }
@@ -4958,6 +5006,7 @@ function saveSettings() {
     poseOrigin: document.getElementById("poseOrigin").value,
     poseMultiAnimal: document.getElementById("poseMultiAnimal").checked,
     poseFramerate: parseFloat(document.getElementById("poseFramerate").value),
+    poseFramerateManual: poseState.framerateManual,
     poseLlh: parseFloat(document.getElementById("poseLlh").value),
     poseMinDuration: parseFloat(document.getElementById("poseMinDuration").value),
     poseByVideo: poseState.poseByVideo,
@@ -4993,6 +5042,9 @@ function loadSettings() {
     setVal("poseOrigin", s.poseOrigin);
     setChecked("poseMultiAnimal", s.poseMultiAnimal);
     setVal("poseFramerate", s.poseFramerate);
+    // Restore whether the user had detached this from the video's detected
+    // rate, so a later video load doesn't silently overwrite their choice.
+    poseState.framerateManual = !!s.poseFramerateManual;
     setVal("poseLlh", s.poseLlh);
     setVal("poseMinDuration", s.poseMinDuration);
     if (s.poseOrigin) poseState.origin = s.poseOrigin;
