@@ -3732,6 +3732,16 @@ poseEl("poseExtract").addEventListener("click", async () => {
               const counts = Object.entries(v.class_counts)
                 .map(([k, n]) => `${k}=${n}`).join(" ");
               poseLog(`${v.id}: ${v.n_rows} rows x ${v.n_features} features | ${counts}`);
+              if (v.frames_skipped > 0) {
+                poseLog(`  note: pose file has ${v.n_frames_total} frames but labels stop at ` +
+                        `${v.n_frames} — skipped ${v.frames_skipped} frames past the last label. ` +
+                        `They would have trained as "other" without anyone having reviewed them.`);
+              }
+              if (v.other_fraction > 0.9) {
+                poseLog(`  warning: ${(v.other_fraction * 100).toFixed(1)}% of samples are "other" — ` +
+                        `the classifier will mostly learn to say "other". Label more, or tick ` +
+                        `"Exclude other" on the Train tab.`);
+              }
               if (v.mean_rejected_fraction > 0.2) {
                 poseLog(`  warning: ${(v.mean_rejected_fraction * 100).toFixed(0)}% of points ` +
                         `were below the likelihood threshold — check tracking quality.`);

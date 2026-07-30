@@ -193,16 +193,34 @@ def extract_one(
     llh_value: float = 0.6,
     animals: list[str] | None = None,
     multi_animal: bool = False,
+    limit_to_labeled: bool = True,
 ) -> dict:
     """Pose + labels for a single recording → aligned (features, targets)."""
     pose_array, is_3d, perc_rect = pose_io.load_and_filter(
         pose_path, origin, bodyparts,
         llh_value=llh_value, animals=animals, multi_animal=multi_animal,
     )
-    n_frames = pose_array.shape[0]
+    n_frames_total = pose_array.shape[0]
+    bin_width = idx.bin_width_from(frames2integ)
+
+    # Stop at the last labeled frame (plus a bin of context).
+    #
+    # "Other" is supposed to mean "the annotator looked at this and it wasn't one
+    # of the behaviors". Frames past the final label mean only "nobody looked",
+    # and a pose file that tracks far more footage than was ever reviewed — a
+    # whole session's .h5 against a short review clip — turns that tail into tens
+    # of thousands of spurious negatives that swamp the real labels. Left in,
+    # a set with a couple of hundred labeled samples can end up 99.8% "other"
+    # and the classifier learns to say "other" and nothing else.
+    n_frames = n_frames_total
+    if limit_to_labeled and label_path and os.path.exists(label_path):
+        _names, frame_to_col = read_label_csv(label_path)
+        if frame_to_col:
+            n_frames = min(n_frames_total, max(frame_to_col) + 1 + bin_width)
+
+    pose_array = pose_array[:n_frames]
 
     features = feat.extract_features([pose_array], frames2integ, is_3d=is_3d)
-    bin_width = idx.bin_width_from(frames2integ)
 
     targets_frame = dense_targets_from_csv(label_path, n_frames, class_names)
     targets = idx.downsample_targets(targets_frame, bin_width, features.shape[0])
@@ -215,6 +233,7 @@ def extract_one(
         "targets": targets[:n],
         "is_3d": is_3d,
         "n_frames": n_frames,
+        "n_frames_total": n_frames_total,
         "bin_width": bin_width,
         "rejected_fraction": [float(p) for p in perc_rect],
     }
@@ -294,12 +313,19 @@ def start_extraction(
                     class_names=np.array(class_names, dtype=object),
                 )
                 counts = np.bincount(out["targets"], minlength=len(class_names))
+                total_rows = int(counts.sum()) or 1
+                other_fraction = float(counts[-1]) / total_rows
                 summary.append({
                     "id": video["id"],
                     "path": path,
                     "n_rows": int(out["features"].shape[0]),
                     "n_features": int(out["features"].shape[1]),
                     "n_frames": int(out["n_frames"]),
+                    "n_frames_total": int(out["n_frames_total"]),
+                    # Set when the pose file tracks past the last label, so the
+                    # UI can point out that pose and video may not match.
+                    "frames_skipped": int(out["n_frames_total"] - out["n_frames"]),
+                    "other_fraction": other_fraction,
                     "is_3d": bool(out["is_3d"]),
                     "class_counts": {
                         name: int(counts[c]) for c, name in enumerate(class_names)
