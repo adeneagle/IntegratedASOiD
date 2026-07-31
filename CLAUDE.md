@@ -34,9 +34,11 @@ jump-to-worst-frame and relabel strip all work as before.
 ```
 ├── LabelingApp/           # Electron app (labeling UI)
 │   ├── main.js            # Main process — spawns Python backend
-│   ├── renderer.js        # Renderer process — all UI logic (~5.4K LOC)
+│   ├── renderer.js        # Renderer process — shell + the A-SOID pipeline panels
+│   ├── labeler-plugin.js  # Plugin registry: the shell/pipeline seam
 │   ├── project-manager.js # Project manifest state
 │   ├── preload.js         # IPC bridge (contextBridge)
+│   ├── EXTRACTION.md      # Plan to split the shell into its own repo
 │   └── index.html / styles.css
 ├── backend/
 │   ├── server.py          # App init + CORS
@@ -48,7 +50,7 @@ jump-to-worst-frame and relabel strip all work as before.
 │   │   └── indexing.py        # feature-row <-> native-frame mapping
 │   ├── routers/           # pose, training, inference, project
 │   └── services/          # pose, training, inference, rlt
-└── tests/                 # pytest suite (132 tests)
+└── tests/                 # pytest suite (140 tests)
 ```
 
 ## Running the App
@@ -123,6 +125,53 @@ writes a row only for in-bout frames. `pose_service.dense_targets_from_csv`
 expands that to one class per frame with every unlabeled frame set to the *last*
 class, `other`. "Other" is trained on but never scored — it means "unlabeled",
 so counting it would inflate F1.
+
+## The labeling shell is shared — keep the seam clean
+
+`LabelingApp/` is being extracted into its own repo: a standalone bout labeler
+that both this project and RealtimeASOID consume, instead of two copies kept in
+sync by hand. `LabelingApp/EXTRACTION.md` has the full plan and measurements;
+what matters day to day is the rule below.
+
+**The shell must not name pipeline-specific code.** The video player, behaviors,
+bouts, CSV, project manifest, timeline overlays, relabel loop, HUD and layout
+are pipeline-agnostic and make **zero** backend calls (labeling works with the
+backend down — that's what makes a standalone build possible). Everything about
+pose files, feature extraction, RandomForests or checkpoints reaches them only
+through `window.labelerPlugins`:
+
+```js
+window.labelerPlugins.register({
+  id: "asoid-pose",
+  hooks:    { onVideoSwitched, onTabShown, onProjectOpened },
+  overlays: [{ id, draw(ctx2d, ctx) }],   // shell sizes/clears the canvas
+  inference:{ buildRequest(ctx), validate(ctx) },
+});
+```
+
+`ctx` comes from `makeContext()` — video name/path, frame index, frame count,
+fps, bouts, behaviors, project manager, `setStatus`. Deliberately a snapshot,
+not a handle on the shell's internals. Hooks that throw are caught and logged,
+so a broken pipeline can never stop someone labeling.
+
+So: **adding a pipeline feature means adding a hook or capability, not a call
+from the shell into the panel.** If you find yourself wanting the shell to call
+something in the Pose/Train/Predict region, that's the signal to add a hook. The
+A-SOID pipeline's code still physically lives in `renderer.js`, but nothing in
+the shell can reach it by name — verified by grepping for `poseState`,
+`resetPoseForVideo` and `getPosePathFor` below the plugin boundary.
+
+**What makes the two pipelines interchangeable** is one contract: inference
+resolves to `{frames: [{index, predicted_class, uncertainty}], class_names}`
+indexed by **native video frame**. That is why the entire Active Learning panel
+ported from RealtimeASOID unchanged, and why the shell can own the uncertainty
+heatmap, misclassification ticks, jump navigation and HUD without knowing what
+kind of model ran. Don't break that shape.
+
+Divergence from RealtimeASOID as measured before the split: `preload.js`
+identical, `main.js` 11 lines, `styles.css` 23, `renderer.js` 1,948 lines but
+**91 of 125 hunks in the pipeline-panel region**. Changes to the shell should
+stay portable to that repo; changes to the panels needn't.
 
 ## Deviations from upstream A-SOID
 
@@ -276,7 +325,7 @@ batch result re-imports as labels for review.
 ## Running Tests
 
 ```bash
-pixi run test                              # all 132
+pixi run test                              # all 140
 pixi run pytest tests/test_asoid_core.py   # single module
 ```
 
