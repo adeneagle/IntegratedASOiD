@@ -3,6 +3,202 @@
 // Registered against the shell through window.labelerPlugins (see
 // labeler-plugin.js). Nothing in core/ may name anything defined here.
 
+// ── Panel markup ──────────────────────────────────────────────────────────
+// The tabs that configure this pipeline. They live here rather than in
+// index.html so the shell's page is the same file for every pipeline — and
+// so deleting this plugin removes its UI with it. Mounted first, because the
+// pose panel code below queries these elements while it loads.
+mountPanels([
+  {
+    tab: "pose",
+    label: "Pose",
+    after: "label",
+    html: `
+<section class="panel-card">
+  <h2>Pose &amp; Features</h2>
+
+  <h3>Pose Source</h3>
+  <div class="form-row">
+    <label><span>Software:</span>
+      <select id="poseOrigin">
+        <option value="deeplabcut" selected>DeepLabCut</option>
+        <option value="sleap">SLEAP</option>
+        <option value="openmonkeystudio">OpenMonkeyStudio (3D)</option>
+      </select>
+    </label>
+    <label class="checkbox-label">
+      <input id="poseMultiAnimal" type="checkbox" />
+      <span>Multi-animal</span>
+    </label>
+  </div>
+  <div class="form-row">
+    <button id="poseAttach">Attach Pose File to Video</button>
+    <span id="posePath" class="path-display">No pose file for this video</span>
+  </div>
+  <p class="hint" id="poseInfo">Attach the pose file that matches the video loaded in the player. Each video keeps its own.</p>
+
+  <h3>Individuals</h3>
+  <div id="poseAnimalList" class="behavior-checklist"></div>
+  <p class="hint" id="poseAnimalHint">Single-animal project — nothing to choose.</p>
+
+  <h3>Body Parts</h3>
+  <div class="form-row">
+    <button id="poseSelectAllBp" class="ghost">Select all</button>
+    <button id="poseSelectNoneBp" class="ghost">Select none</button>
+    <span class="muted">Features use every <em>pair</em>, so cost grows quickly: <output id="poseFeatureWidth">—</output></span>
+  </div>
+  <div id="poseBodypartList" class="behavior-checklist"></div>
+  <p class="hint">The selection is baked into the model — a trained model can only be applied to this exact set. Changing it requires re-extracting and retraining.</p>
+
+  <h3>Parameters</h3>
+  <div class="form-row">
+    <label><span>Frame rate (fps):</span>
+      <input id="poseFramerate" type="number" min="1" max="240" step="0.1" value="30" />
+    </label>
+    <button id="poseUseVideoFps" class="ghost" title="Reset to the video's detected frame rate">Use video FPS</button>
+    <label><span>Likelihood threshold:</span>
+      <input id="poseLlh" type="number" min="0" max="1" step="0.05" value="0.6" />
+    </label>
+  </div>
+  <p class="hint">Frame rate is read from the loaded video (WebCodecs mode detects it from the file's own container timing — see FPS in the player controls) and kept in sync here automatically. Edit it directly only if the pose file was estimated at a different rate than the video.</p>
+  <div class="form-row">
+    <label><span>Min behavior duration (s):</span>
+      <input id="poseMinDuration" type="number" min="0.05" max="5" step="0.05" value="0.1" />
+    </label>
+    <span class="muted">Bin: <output id="poseBinWidth">3</output> frames <span id="poseBinMs">(100 ms)</span></span>
+  </div>
+  <p class="hint">Points below the likelihood threshold hold their last confident position. The bin is the temporal resolution of both training and predictions.</p>
+
+  <h3>Extract Features</h3>
+  <div class="form-row">
+    <label><span>Iteration:</span>
+      <input id="poseIteration" type="number" min="0" step="1" value="0" />
+    </label>
+    <button id="poseNewIteration" class="ghost">New Iteration</button>
+    <span class="muted">Refined labels &rarr; a fresh feature set + model.</span>
+  </div>
+  <div id="poseVideoChecklist" class="video-checklist"></div>
+  <div class="form-row">
+    <button id="poseExtract" class="primary">Extract Features</button>
+    <button id="poseStopExtract" class="danger" disabled>Stop</button>
+  </div>
+  <div class="progress-area">
+    <progress id="poseProgress" value="0" max="100"></progress>
+    <span id="poseStatus">Idle</span>
+  </div>
+  <pre id="poseLog" class="train-log" style="display:none;"></pre>
+</section>
+`,
+  },
+  {
+    tab: "train",
+    label: "Train",
+    after: "pose",
+    html: `
+<section class="panel-card">
+  <h2>Training</h2>
+
+  <h3>Data Sources</h3>
+  <div id="trainVideoChecklist" class="video-checklist"></div>
+  <p class="hint">Videos with extracted features. Run the Pose tab first if this list is empty.</p>
+
+  <h3>Active Learning</h3>
+  <div class="form-row">
+    <label><span>Initial ratio:</span>
+      <input id="trainInitRatio" type="number" value="0.01" min="0.001" max="1" step="0.005" />
+    </label>
+    <label><span>Confidence threshold:</span>
+      <input id="trainConfThreshold" type="number" value="0.5" min="0.05" max="0.99" step="0.05" />
+    </label>
+  </div>
+  <div class="form-row">
+    <label><span>Max iterations:</span>
+      <input id="trainMaxIter" type="number" value="100" min="1" max="1000" />
+    </label>
+    <label><span>Samples per iteration:</span>
+      <input id="trainMaxSamplesIter" type="number" value="20" min="1" max="1000" />
+    </label>
+  </div>
+  <div class="form-row">
+    <label class="checkbox-label">
+      <input id="trainExcludeOther" type="checkbox" />
+      <span>Exclude "other" from training</span>
+    </label>
+  </div>
+  <p class="hint">Start from <em>initial ratio</em> of each class, then repeatedly add the samples the model is least sure about (max probability below the threshold) until it stops being confused. "Other" is never scored — it means <em>unlabeled</em>, so counting it would inflate the result.</p>
+
+  <h3>Binarize</h3>
+  <div id="trainBinarizeList" class="behavior-checklist"></div>
+  <p class="hint">Leave all unticked for multi-class. Tick one behavior to train it against everything else; tick several to merge them into a single positive class first.</p>
+
+  <h3>Run</h3>
+  <div class="form-row">
+    <label><span>Model name:</span>
+      <input id="trainModelName" type="text" value="rf_model" placeholder="rf_model" />
+    </label>
+  </div>
+  <div class="form-row">
+    <button id="trainStart" class="primary">Start Training</button>
+    <button id="trainStop" class="danger" disabled>Stop</button>
+  </div>
+  <div class="progress-area">
+    <progress id="trainProgress" value="0" max="100"></progress>
+    <span id="trainStatus">Idle</span>
+  </div>
+  <div id="trainMetrics" class="metrics-display" style="display:none;">
+    <div>Iteration: <span id="trainIteration">-</span> / <span id="trainTotalIters">-</span></div>
+    <div>Macro F1: <span id="trainMacroF1">-</span></div>
+    <div>Ceiling (all data): <span id="trainCeilingF1">-</span></div>
+    <div>Training samples: <span id="trainNSamples">-</span></div>
+    <div>Low-confidence remaining: <span id="trainLowConf">-</span></div>
+    <div>Per-class F1: <span id="trainPerClassF1">-</span></div>
+  </div>
+  <pre id="trainLog" class="train-log" style="display:none;"></pre>
+</section>
+`,
+  },
+  {
+    tab: "predict",
+    label: "Predict",
+    after: "active-learning",
+    html: `
+<section class="panel-card">
+  <h2>Batch Predict</h2>
+  <p class="hint">Apply a trained model to pose files that were never labeled. Results are written as frame-indexed one-hot CSVs — the same format the Label tab imports, so you can load one back in to review it.</p>
+
+  <h3>Model</h3>
+  <div class="form-row">
+    <button id="predSelectCheckpoint">Select Model</button>
+    <span id="predCheckpointPath" class="path-display">No model</span>
+  </div>
+
+  <h3>Pose Files</h3>
+  <div class="form-row">
+    <button id="predAddFiles">Add Pose Files</button>
+    <button id="predClearFiles" class="ghost">Clear</button>
+  </div>
+  <div id="predFileList" class="data-sources"></div>
+
+  <h3>Output</h3>
+  <div class="form-row">
+    <button id="predSelectOutDir">Choose Output Folder</button>
+    <span id="predOutDir" class="path-display">predictions/ in the project</span>
+  </div>
+
+  <div class="form-row">
+    <button id="predRun" class="primary">Run Batch Predict</button>
+    <button id="predStop" class="danger" disabled>Stop</button>
+  </div>
+  <div class="progress-area">
+    <progress id="predProgress" value="0" max="100"></progress>
+    <span id="predStatus">Idle</span>
+  </div>
+  <pre id="predLog" class="train-log" style="display:none;"></pre>
+</section>
+`,
+  },
+]);
+
 // ── Pose Panel ────────────────────────────────────────────────────────────
 // Replaces the TSM app's Preprocess panel. Where that one computed a
 // background, tuned a crop and dumped PNG frames, this one just points at a

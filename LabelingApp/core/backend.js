@@ -71,24 +71,31 @@ setInterval(checkBackendHealth, 10000);
 
 // ── Tab switching ─────────────────────────────────────────────────────────
 
-document.querySelectorAll(".tab-bar .tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-bar .tab").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    const tabName = btn.dataset.tab;
-    document.querySelectorAll(".tab-panel").forEach((p) => {
-      p.classList.toggle("active", p.dataset.tab === tabName);
-    });
-    document.body.dataset.tab = tabName;
-    updateContentLayout();
-    // Pipeline-owned tabs refresh themselves through the plugin seam.
-    try {
-      if (window.labelerPlugins) {
-        window.labelerPlugins.emit("onTabShown", { ...makeContext(), tab: tabName });
-      }
-    } catch (err) { console.warn("[labeler] onTabShown failed", err); }
-  });
+// Delegated, so it also covers tabs a pipeline mounts later (see
+// core/panels.js). Binding each button directly would only have caught the two
+// tabs index.html ships with.
+document.querySelector(".tab-bar").addEventListener("click", (e) => {
+  const btn = e.target.closest(".tab");
+  if (!btn) return;
+  showTab(btn.dataset.tab);
 });
+
+function showTab(tabName) {
+  document.querySelectorAll(".tab-bar .tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tabName);
+  });
+  document.querySelectorAll(".tab-panel").forEach((p) => {
+    p.classList.toggle("active", p.dataset.tab === tabName);
+  });
+  document.body.dataset.tab = tabName;
+  updateContentLayout();
+  // Pipeline-owned tabs refresh themselves through the plugin seam.
+  try {
+    if (window.labelerPlugins) {
+      window.labelerPlugins.emit("onTabShown", { ...makeContext(), tab: tabName });
+    }
+  } catch (err) { console.warn("[labeler] onTabShown failed", err); }
+}
 
 // ── Video path / frame count ──────────────────────────────────────────────
 function getVideoPath() {
