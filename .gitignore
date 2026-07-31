@@ -50,3 +50,6 @@ Thumbs.db
 *.log
 *.bak
 *.rlt
+
+# CodeGraph index
+.codegraph/

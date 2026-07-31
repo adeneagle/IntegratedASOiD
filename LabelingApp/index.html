@@ -465,8 +465,44 @@
       <div id="status" class="status"></div>
     </div>
 
+    <!-- Classic scripts, evaluated in this order. They share one global scope,
+         so this is the same program renderer.js used to be — just cut along the
+         boundaries it already had. The one rule: nothing in core/ may name
+         anything defined in plugins/; the shell reaches a pipeline only through
+         window.labelerPlugins. -->
+    <!-- Host identity. The shell is generic; this is the only place that says
+         which application it is. Distinct settingsKey values keep two labelers
+         installed side by side from overwriting each other's preferences. -->
+    <script>
+      window.LABELER_APP = { id: "asoid-desktop", settingsKey: "asoidDesktop_settings" };
+    </script>
+
     <script src="labeler-plugin.js"></script>
     <script src="project-manager.js"></script>
-    <script type="module" src="renderer.js"></script>
+
+    <script src="core/state.js"></script>
+    <script src="core/player.js"></script>
+    <script src="core/behaviors.js"></script>
+    <script src="core/progress.js"></script>
+    <script src="core/layout.js"></script>
+    <script src="core/videos.js"></script>
+    <script src="core/csv.js"></script>
+    <script src="core/trackbar.js"></script>
+    <script src="core/backend.js"></script>
+
+    <!-- The pipeline. Swapping this one line is what turns the shell into a
+         different application; drop it entirely for the standalone labeler. -->
+    <script src="plugins/asoid-pose.js"></script>
+
+    <script src="core/active-learning.js"></script>
+    <script src="core/hud.js"></script>
+    <script src="core/inference.js"></script>
+    <script src="core/timeline.js"></script>
+    <script src="core/settings.js"></script>
+    <script src="core/events.js"></script>
+    <script src="core/project.js"></script>
+
+    <!-- Last: modules declare, boot executes. -->
+    <script src="core/boot.js"></script>
   </body>
 </html>
