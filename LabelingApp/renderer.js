@@ -1682,6 +1682,38 @@ const updateContentLayout = () => {
     : "auto 1fr";
 };
 
+// ── Pipeline plugin seam ──────────────────────────────────────────────────
+// The shell below knows nothing about pose files, TSM models or RandomForests.
+// A pipeline registers itself with window.labelerPlugins (see labeler-plugin.js)
+// and the shell talks to it only through these two helpers. Keeping the arrow
+// pointing this way is what lets the labeling shell become a standalone app.
+
+// The state a plugin is allowed to see. Deliberately a snapshot of the things
+// that are meaningful to any pipeline — not a handle on the shell's internals.
+function makeContext() {
+  return {
+    videoName: currentVideoName,
+    videoPath: getVideoPath(),
+    frameIndex: currentFrameIndex,
+    frameCount: videoFrameCount(),
+    fps: Number(fpsInput.value) || 30,
+    bouts,
+    behaviors,
+    projectManager: window.projectManager || null,
+    setStatus,
+  };
+}
+
+// Fire a lifecycle hook at every registered pipeline. Safe before any plugin
+// has registered, and safe during module evaluation.
+function emitPlugin(hookName) {
+  try {
+    if (window.labelerPlugins) window.labelerPlugins.emit(hookName, makeContext());
+  } catch (err) {
+    console.warn(`[labeler] hook "${hookName}" failed`, err);
+  }
+}
+
 // ── Player / panel split sizing ───────────────────────────────────────────
 // The player's width is a grid `fr` share (--player-col) weighed against the
 // side panels' 1fr. Dragging the splitter rewrites that share, and it's
@@ -1908,7 +1940,7 @@ const switchToVideo = (videoName) => {
   localStorage.setItem("lastActiveVideo", videoName);
   renderVideoSidebar();
   // Point the Pose panel (and the skeleton overlay) at this video's pose file.
-  try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
+  emitPlugin("onVideoSwitched");
 };
 
 const nextBehaviorKey = () => {
@@ -1978,7 +2010,7 @@ const loadHtml5File = (file) => {
   resetSession();
   restoreProgress(file.name);
   restorePredictions(file.name);
-  try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
+  emitPlugin("onVideoSwitched");
   setStatus(`Loaded ${file.name}`);
 };
 
@@ -2102,7 +2134,7 @@ const loadWebcodecsFile = async (file) => {
     webcodecsOperationInProgress = false;
     restoreProgress(file.name);
     restorePredictions(file.name);
-    try { resetPoseForVideo(); } catch { /* pose panel not initialized yet */ }
+    emitPlugin("onVideoSwitched");
     video.removeAttribute("src");
     video.load();
   }
@@ -3325,7 +3357,12 @@ document.querySelectorAll(".tab-bar .tab").forEach((btn) => {
     document.body.dataset.tab = tabName;
     updateContentLayout();
     if (tabName === "train") renderTrainVideoChecklist();
-    if (tabName === "pose") renderPoseVideoChecklist();
+    // Pipeline-owned tabs refresh themselves through the plugin seam.
+    try {
+      if (window.labelerPlugins) {
+        window.labelerPlugins.emit("onTabShown", { ...makeContext(), tab: tabName });
+      }
+    } catch (err) { console.warn("[labeler] onTabShown failed", err); }
   });
 });
 
@@ -3968,10 +4005,10 @@ function sizePoseCanvas() {
   }
 }
 
+// Registered as a plugin overlay; the shell clears and sizes the canvas, then
+// calls this with the 2d context. Draws nothing when there's no pose to draw.
 function drawPoseOverlay() {
   if (!poseCtx || !poseState.keypoints) return;
-  sizePoseCanvas();
-  poseCtx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
 
   const frame = currentFrameIndex;
   const pts = poseState.keypoints.points || [];
@@ -4014,6 +4051,8 @@ function drawPoseOverlay() {
   }
 }
 
+// The shell's overlay loop: sizes and clears the canvas, then hands the 2d
+// context to every overlay a pipeline registered. Knows nothing about pose.
 function poseOverlayTick() {
   if (!poseEl("showPoseOverlay").checked) { poseOverlayRaf = null; return; }
   // Redraw on a frame change, OR when the video's dimensions have just become
@@ -4028,7 +4067,18 @@ function poseOverlayTick() {
   if (currentFrameIndex !== poseOverlayLastFrame || sizeKey !== poseOverlayLastSize) {
     poseOverlayLastFrame = currentFrameIndex;
     poseOverlayLastSize = sizeKey;
-    drawPoseOverlay();
+    if (poseCtx) {
+      sizePoseCanvas();
+      poseCtx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+      const ctx = makeContext();
+      for (const o of window.labelerPlugins.overlays()) {
+        try {
+          o.draw(poseCtx, ctx);
+        } catch (err) {
+          console.warn(`[labeler] overlay "${o.id}" draw failed`, err);
+        }
+      }
+    }
   }
   poseOverlayRaf = requestAnimationFrame(poseOverlayTick);
 }
@@ -4077,6 +4127,49 @@ function resetPoseForVideo() {
   }
   renderPoseVideoChecklist();
 }
+
+// ── Register this pipeline with the shell ─────────────────────────────────
+// Everything above is pose-specific: it belongs to the A-SOID pipeline, not to
+// the labeling shell. Registering it here means the shell reaches it only
+// through the plugin seam — no core code names a pose function — which is what
+// makes the shell extractable as a standalone labeler, with RealtimeASOID's
+// video pipeline registering in exactly the same way.
+//
+// The functions themselves still live in this file; moving them into their own
+// module is mechanical once the seam holds.
+window.labelerPlugins.register({
+  id: "asoid-pose",
+
+  hooks: {
+    // A different video is active: repoint the pose file, overlay and panel.
+    onVideoSwitched: () => resetPoseForVideo(),
+    // The Pose tab became visible: its video checklist may be stale.
+    onTabShown: (ctx) => {
+      if (ctx.tab === "pose") renderPoseVideoChecklist();
+    },
+    onProjectOpened: () => renderPoseVideoChecklist(),
+  },
+
+  // Drawn over the video frame by the shell's overlay loop.
+  overlays: [{ id: "pose-skeleton", draw: drawPoseOverlay }],
+
+  // Turn the shell's context into this backend's inference request. The
+  // response must come back in the standard predictions shape.
+  inference: {
+    buildRequest: (ctx) => ({
+      pose_path: getPosePathFor(ctx.videoName),
+      origin: poseState.origin,
+      bodyparts: null,   // null = use the selection recorded on the checkpoint
+      llh_value: parseFloat(poseEl("poseLlh").value) || 0.6,
+      animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
+      multi_animal: poseState.multiAnimal,
+    }),
+    // What the shell should say when the pipeline can't run yet.
+    validate: (ctx) => (getPosePathFor(ctx.videoName)
+      ? null
+      : "This video has no pose file attached. Attach one in the Pose tab first."),
+  },
+});
 
 // ── Training Panel ────────────────────────────────────────────────────────
 
@@ -4915,11 +5008,13 @@ function resolveAlFrameRanges() {
 // the checkpoint itself, so the feature space always matches how it was trained.
 document.getElementById("alRunInference").addEventListener("click", async () => {
   if (!alState.checkpointPath) { alert("Select a checkpoint first."); return; }
-  const posePath = getPosePathFor(currentVideoName);
-  if (!posePath) {
-    alert("This video has no pose file attached. Attach one in the Pose tab first.");
-    return;
-  }
+
+  // The shell doesn't know what this pipeline needs to run — it asks.
+  const inference = window.labelerPlugins.capability("inference");
+  if (!inference) { alert("No pipeline is registered to run inference."); return; }
+  const ctx = makeContext();
+  const problem = inference.validate ? inference.validate(ctx) : null;
+  if (problem) { alert(problem); return; }
 
   const scopeResult = resolveAlFrameRanges();
   if (scopeResult.error) { alert(scopeResult.error); return; }
@@ -4934,14 +5029,8 @@ document.getElementById("alRunInference").addEventListener("click", async () => 
       method: "POST",
       body: JSON.stringify({
         checkpoint_path: alState.checkpointPath,
-        pose_path: posePath,
-        origin: poseState.origin,
-        // null = use the checkpoint's own body-part selection.
-        bodyparts: null,
-        llh_value: parseFloat(document.getElementById("poseLlh").value) || 0.6,
-        animals: poseState.multiAnimal ? [...poseState.selectedAnimals] : null,
-        multi_animal: poseState.multiAnimal,
         frame_ranges: frameRanges,
+        ...inference.buildRequest(ctx),
       }),
     });
     alState.taskId = res.task_id;
@@ -5611,7 +5700,7 @@ function updateProjectUI() {
     exportRltPkgBtn.classList.add("hidden");
   }
   renderTrainVideoChecklist();
-  renderPoseVideoChecklist();
+  emitPlugin("onProjectOpened");
   // The iteration belongs to the project, not the session — restore it so
   // reopening doesn't silently start writing over iteration-0 again.
   try {
