@@ -49,3 +49,14 @@ function mountPanels(panels) {
     if (afterPanel) afterPanel.after(panel); else content.appendChild(panel);
   }
 }
+
+// Fill one of the shell's slots — currently #alPipelineOptions, the gap in the
+// Active Learning panel where a pipeline puts the controls its own inference
+// needs. Silently does nothing if the slot isn't in this build's index.html, so
+// a plugin can offer options a stripped-down shell doesn't have a place for.
+function mountSlot(slotId, html) {
+  const slot = document.getElementById(slotId);
+  if (!slot) return false;
+  slot.innerHTML = html;
+  return true;
+}

@@ -199,6 +199,14 @@ mountPanels([
   },
 ]);
 
+// The shell's Active Learning tab leaves a gap for whatever else a pipeline's
+// inference needs. This one needs no extra controls — body parts and bin width
+// are recorded on the checkpoint — so it only explains what will run.
+mountSlot("alPipelineOptions",
+  '<p class="hint">Inference runs on this video\'s pose file. Body parts and ' +
+  'bin width come from the model itself, so they always match how it was ' +
+  'trained.</p>');
+
 // ── Pose Panel ────────────────────────────────────────────────────────────
 // Replaces the TSM app's Preprocess panel. Where that one computed a
 // background, tuned a crop and dumped PNG frames, this one just points at a
@@ -1358,6 +1366,9 @@ window.labelerPlugins.register({
 
   // Drawn over the video frame by the shell's overlay loop.
   overlays: [{ id: "pose-skeleton", draw: drawPoseOverlay }],
+
+  // What a trained model looks like on disk, for the shell's file pickers.
+  models: { label: "Models", extensions: ["joblib"] },
 
   // Turn the shell's context into this backend's inference request. The
   // response must come back in the standard predictions shape.

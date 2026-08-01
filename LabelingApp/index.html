@@ -199,7 +199,11 @@
                 <button id="alUseNewest" class="ghost" title="Pick the most recently trained model in this project">Use newest</button>
                 <span id="alCheckpointPath" class="path-display">No checkpoint</span>
               </div>
-              <p class="hint">Inference runs on this video's pose file. Body parts and bin width come from the model itself, so they always match how it was trained.</p>
+              <!-- Filled by the pipeline: whatever else its inference needs
+                   (a frame grouping, a background image) plus a line saying
+                   what inference actually runs on. Empty in the standalone
+                   labeler, and the panel reads fine without it. -->
+              <div id="alPipelineOptions"></div>
               <div class="form-row">
                 <label><span>Scope:</span>
                   <select id="alScope">

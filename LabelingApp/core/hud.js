@@ -252,12 +252,20 @@ document.getElementById("alUseNewest").addEventListener("click", () => {
   });
 });
 
+// What a trained model looks like on disk — .joblib for a random forest, .ckpt
+// for a torch checkpoint. The shell shouldn't know, so it asks the pipeline.
+function modelFileFilters() {
+  const models = window.labelerPlugins && window.labelerPlugins.capability("models");
+  const exts = (models && models.extensions) || ["*"];
+  return [{ name: (models && models.label) || "Models", extensions: exts }];
+}
+
 // Select checkpoint
 document.getElementById("alSelectCheckpoint").addEventListener("click", async () => {
   if (!window.api) return;
   const res = await window.api.selectFile({
     title: "Select Model Checkpoint",
-    filters: [{ name: "Models", extensions: ["joblib"] }],
+    filters: modelFileFilters(),
   });
   if (!res.canceled) {
     alState.checkpointPath = res.path;

@@ -134,7 +134,7 @@ async function relinkProjectModels(manifest) {
     if (!ok) continue;
     const res = await window.api.selectFile({
       title: `Locate model for "${m.name}"`,
-      filters: [{ name: "Models", extensions: ["joblib"] }],
+      filters: modelFileFilters(),
     });
     if (res && !res.canceled) {
       window.projectManager.updateModelPath(m.path, res.path);
@@ -265,10 +265,14 @@ async function doExportRlt(pkg) {
     }
     const s = result.summary;
     if (s.packaged) {
-      setStatus(
-        `Exported package .rlt: ${s.videos} video(s), ${s.labels} label set(s), ` +
-        `${s.pose} pose file(s), ${s.features} feature set(s), ${s.checkpoints} model(s).`
-      );
+      // What a package contains is up to the backend — pose files and feature
+      // sets for one pipeline, extracted frames and backgrounds for another —
+      // so report whatever it counted rather than naming the parts here.
+      const counted = Object.entries(s)
+        .filter(([k, v]) => k !== "packaged" && typeof v === "number" && v > 0)
+        .map(([k, v]) => `${v} ${k}`)
+        .join(", ");
+      setStatus(`Exported package .rlt: ${counted || "nothing to package"}.`);
     } else {
       setStatus(`Exported .rlt: ${s.videos} video reference(s), ${s.labels} label set(s).`);
     }
