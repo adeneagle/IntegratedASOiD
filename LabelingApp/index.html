@@ -3,15 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>A-SOID Desktop</title>
+    <!-- Filled in from window.LABELER_APP (see the bottom of this file), which
+         is the one place a build says which application it is. -->
+    <title data-app="name">Labeler</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <div class="app">
       <header class="header">
         <div class="title">
-          <h1>A-SOID Desktop</h1>
-          <p>Label, extract pose features, train, and refine animal behavior classifiers.</p>
+          <h1 data-app="name">Labeler</h1>
+          <p data-app="tagline">Label, train, and refine animal behavior classifiers.</p>
         </div>
         <div class="header-actions">
           <span id="projectName" class="project-name"></span>
@@ -45,7 +47,7 @@
       <div id="projectGate" class="project-gate hidden">
         <div class="project-gate-card">
           <h2>Open a project to begin</h2>
-          <p>A-SOID Desktop keeps your videos, pose files, labels, features, and models together in a project.</p>
+          <p data-app="gate">Everything this project needs — videos, labels and models — is kept together in one folder.</p>
           <div class="project-gate-actions">
             <button id="gateNewProject" class="primary">New Project</button>
             <button id="gateOpenProject">Open Project</button>
@@ -76,9 +78,10 @@
           <div id="videoShell" class="video-shell">
             <video id="video" preload="metadata"></video>
             <canvas id="videoCanvas"></canvas>
-            <!-- Pose skeleton overlay: sized to the video's natural resolution so
-                 keypoints can be drawn in the pose file's own pixel coordinates. -->
-            <canvas id="poseCanvas"></canvas>
+            <!-- Anything the pipeline wants to draw over the frame in its own
+                 element rather than through the shell's overlay loop — A-SOID's
+                 pose skeleton canvas goes here. -->
+            <div id="videoOverlaySlot"></div>
             <!-- On-video readout of this frame's prediction vs. its label -->
             <div id="videoHud" class="video-hud">
               <div class="hud-row hud-pred">
@@ -122,10 +125,8 @@
               <input id="showHud" type="checkbox" checked />
               <span>Info overlay</span>
             </label>
-            <label class="pause-control">
-              <input id="showPoseOverlay" type="checkbox" />
-              <span>Pose overlay</span>
-            </label>
+            <!-- Player toggles the pipeline owns (A-SOID's pose overlay). -->
+            <span id="playerControlsSlot"></span>
             <div class="time">
               <span id="currentTime">00:00:000</span>
               <span>/</span>
@@ -297,7 +298,13 @@
          which application it is. Distinct settingsKey values keep two labelers
          installed side by side from overwriting each other's preferences. -->
     <script>
-      window.LABELER_APP = { id: "asoid-desktop", settingsKey: "asoidDesktop_settings" };
+      window.LABELER_APP = {
+        id: "asoid-desktop",
+        settingsKey: "asoidDesktop_settings",
+        name: "A-SOID Desktop",
+        tagline: "Label, extract pose features, train, and refine animal behavior classifiers.",
+        gate: "A-SOID Desktop keeps your videos, pose files, labels, features, and models together in a project.",
+      };
     </script>
 
     <script src="labeler-plugin.js"></script>

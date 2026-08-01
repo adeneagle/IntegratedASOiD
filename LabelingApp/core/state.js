@@ -34,6 +34,14 @@ const statusEl = document.getElementById("status");
 
 const KEY_ORDER = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 
+// index.html carries placeholder copy marked data-app="name|tagline|gate"; the
+// host fills it in from window.LABELER_APP. Keeping the page free of any one
+// app's name is what lets the same file ship with either pipeline.
+for (const el of document.querySelectorAll("[data-app]")) {
+  const text = (window.LABELER_APP || {})[el.dataset.app];
+  if (text) el.textContent = text;
+}
+
 // Populated by core/behaviors.js as soon as loadBehaviors() exists. Function
 // declarations hoist within a script but not across them, so this can no longer
 // be initialized here the way it was when everything lived in one file.

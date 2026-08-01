@@ -776,6 +776,31 @@ poseEl("poseIteration").addEventListener("change", () => {
 // Deliberately shows RAW, unfiltered keypoints: the whole point is to reveal
 // where tracking failed, which the hold-last-position filter would hide.
 
+// The canvas and its toggle are this pipeline's, so this file supplies them
+// rather than index.html. It sits above both playback paths with the identical
+// object-fit: contain box, so keypoints land exactly on the animal.
+mountSlot("videoOverlaySlot", `
+<style>
+  #poseCanvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+    z-index: 2;          /* above both players, below the HUD */
+    display: none;
+  }
+</style>
+<canvas id="poseCanvas"></canvas>
+`);
+mountSlot("playerControlsSlot", `
+<label class="pause-control">
+  <input id="showPoseOverlay" type="checkbox" />
+  <span>Pose overlay</span>
+</label>
+`);
+
 const poseCanvas = document.getElementById("poseCanvas");
 const poseCtx = poseCanvas ? poseCanvas.getContext("2d") : null;
 let poseOverlayRaf = null;

@@ -475,19 +475,16 @@ video {
   color: #fca5a5;
 }
 
-/* Pose skeleton overlay. Sits above both playback paths (the WebCodecs canvas
-   and the plain <video>) with the identical object-fit: contain box, so the
-   keypoints — drawn in the pose file's native pixel coordinates on a canvas
-   sized to the video's natural resolution — land exactly on the animal. */
-#poseCanvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  pointer-events: none;
-  z-index: 2;
-  display: none;
+/* Anything a pipeline draws over the frame mounts into #videoOverlaySlot and
+   styles itself (see plugins/asoid-pose.js). z-index 2 is reserved for it —
+   above both playback paths, below the HUD at 3. */
+/* Both slots are pass-throughs: display:contents keeps the wrapper from
+   generating a box, so mounted children lay out as if index.html had written
+   them inline — absolutely positioned against .video-shell, or as direct flex
+   items of .controls. */
+#videoOverlaySlot,
+#playerControlsSlot {
+  display: contents;
 }
 
 .controls {
