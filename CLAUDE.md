@@ -32,14 +32,18 @@ jump-to-worst-frame and relabel strip all work as before.
 ## Project Structure
 
 ```
-├── LabelingApp/           # Electron app (labeling UI)
-│   ├── main.js            # Main process — spawns Python backend
-│   ├── renderer.js        # Renderer process — shell + the A-SOID pipeline panels
-│   ├── labeler-plugin.js  # Plugin registry: the shell/pipeline seam
-│   ├── project-manager.js # Project manifest state
-│   ├── preload.js         # IPC bridge (contextBridge)
-│   ├── EXTRACTION.md      # Plan to split the shell into its own repo
-│   └── index.html / styles.css
+├── LabelingApp/           # Electron app. Four files are ours; the rest is the
+│   │                      # @asoid/labeling-shell package (see the section below).
+│   ├── app.js             # OURS — which application this is
+│   ├── app.config.json    # OURS — window title, project folder layout
+│   ├── plugins/pipeline.js# OURS — the whole A-SOID pipeline: Pose/Train/Predict
+│   ├── project-manager.js # OURS — project manifest (schema is pipeline-specific)
+│   ├── index.html         # shell — names no application and no pipeline
+│   ├── core/              # shell — 18 classic scripts, loaded in order
+│   ├── labeler-plugin.js  # shell — plugin registry: the shell/pipeline seam
+│   ├── main.js            # shell — main process; spawns the Python backend
+│   ├── preload.js         # shell — IPC bridge (contextBridge)
+│   └── tools/             # shell — `npm run check` invariants
 ├── backend/
 │   ├── server.py          # App init + CORS
 │   ├── asoid_core/        # Vendored A-SOID numerics (Streamlit-free)
@@ -126,26 +130,45 @@ expands that to one class per frame with every unlabeled frame set to the *last*
 class, `other`. "Other" is trained on but never scored — it means "unlabeled",
 so counting it would inflate F1.
 
-## The labeling shell is shared — keep the seam clean
+## The labeling shell is upstream — don't edit it here
 
-`LabelingApp/` is being extracted into its own repo: a standalone bout labeler
-that both this project and RealtimeASOID consume, instead of two copies kept in
-sync by hand. `LabelingApp/EXTRACTION.md` has the full plan and measurements;
-what matters day to day is the rule below.
+`LabelingApp/` used to be a 6,000-line `renderer.js` maintained as two drifting
+copies, one here and one in RealtimeASOID. The shell is now its own repo,
+`@asoid/labeling-shell`, which both projects consume and which also runs
+standalone as a bout labeler with no model behind it.
+
+**Only four files in `LabelingApp/` belong to this project**: `app.js`,
+`app.config.json`, `plugins/pipeline.js`, `project-manager.js`. Everything else
+is synced in. Editing a synced file here is the mistake to avoid — the next
+`npm run shell:sync` overwrites it silently. Fix it in the shell repo, then:
+
+```bash
+npm run verify        # sync from the package, then run the checks
+```
+
+The synced files are committed rather than gitignored, so an accidental local
+edit shows up as a diff in review.
+
+### The rule that keeps this working
 
 **The shell must not name pipeline-specific code.** The video player, behaviors,
 bouts, CSV, project manifest, timeline overlays, relabel loop, HUD and layout
-are pipeline-agnostic and make **zero** backend calls (labeling works with the
-backend down — that's what makes a standalone build possible). Everything about
+make **zero** backend calls — labeling works with the backend down, which is
+what makes the standalone build real rather than aspirational. Everything about
 pose files, feature extraction, RandomForests or checkpoints reaches them only
 through `window.labelerPlugins`:
 
 ```js
+mountPanels([{ tab: "pose", label: "Pose", after: "label", html: `…` }]);
+mountSlot("alPipelineOptions", `…`);
+
 window.labelerPlugins.register({
   id: "asoid-pose",
-  hooks:    { onVideoSwitched, onTabShown, onProjectOpened },
-  overlays: [{ id, draw(ctx2d, ctx) }],   // shell sizes/clears the canvas
-  inference:{ buildRequest(ctx), validate(ctx) },
+  hooks:     { onVideoSwitched, onTabShown, onProjectOpened },
+  overlays:  [{ id, draw(ctx2d, ctx) }],
+  models:    { label: "Models", extensions: ["joblib"] },
+  inference: { buildRequest(ctx), validate(ctx) },
+  settings:  { save(), load(saved) },
 });
 ```
 
@@ -155,23 +178,19 @@ not a handle on the shell's internals. Hooks that throw are caught and logged,
 so a broken pipeline can never stop someone labeling.
 
 So: **adding a pipeline feature means adding a hook or capability, not a call
-from the shell into the panel.** If you find yourself wanting the shell to call
-something in the Pose/Train/Predict region, that's the signal to add a hook. The
-A-SOID pipeline's code still physically lives in `renderer.js`, but nothing in
-the shell can reach it by name — verified by grepping for `poseState`,
-`resetPoseForVideo` and `getPosePathFor` below the plugin boundary.
+from the shell into the panel.** Wanting `core/` to call something in
+`plugins/pipeline.js` is the signal that a hook is missing. `npm run check`
+enforces it, along with two other things `node --check` cannot see: that nothing
+a script runs at load time is declared later in the load order (hoisting stops
+at each `<script>` boundary — this is what `core/boot.js` exists for), and that
+`project-manager.js` defines every method `core/` calls.
 
 **What makes the two pipelines interchangeable** is one contract: inference
 resolves to `{frames: [{index, predicted_class, uncertainty}], class_names}`
 indexed by **native video frame**. That is why the entire Active Learning panel
-ported from RealtimeASOID unchanged, and why the shell can own the uncertainty
+is shared code rather than a second copy, and why the shell owns the uncertainty
 heatmap, misclassification ticks, jump navigation and HUD without knowing what
 kind of model ran. Don't break that shape.
-
-Divergence from RealtimeASOID as measured before the split: `preload.js`
-identical, `main.js` 11 lines, `styles.css` 23, `renderer.js` 1,948 lines but
-**91 of 125 hunks in the pipeline-panel region**. Changes to the shell should
-stay portable to that repo; changes to the panels needn't.
 
 ## Deviations from upstream A-SOID
 
