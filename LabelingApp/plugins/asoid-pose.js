@@ -791,6 +791,11 @@ mountSlot("videoOverlaySlot", `
     z-index: 2;          /* above both players, below the HUD */
     display: none;
   }
+  /* Pose/video frame-count mismatch — a silent-but-fatal misconfiguration. */
+  .pose-warning {
+    color: #b45309;
+    font-weight: 600;
+  }
 </style>
 <canvas id="poseCanvas"></canvas>
 `);

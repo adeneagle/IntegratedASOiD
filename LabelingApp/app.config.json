@@ -1,0 +1,10 @@
+{
+  "title": "A-SOID Desktop",
+  "projectDirs": [
+    "labels",
+    "predictions",
+    "iteration-0/features",
+    "models/checkpoints"
+  ],
+  "manifestVersion": 2
+}
