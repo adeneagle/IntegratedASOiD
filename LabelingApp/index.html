@@ -3,8 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- Filled in from window.LABELER_APP (see the bottom of this file), which
-         is the one place a build says which application it is. -->
+    <!-- This page names no application and no pipeline: it is the same file in
+         every build. The copy marked data-app is filled in from app.js, and the
+         pipeline arrives as plugins/pipeline.js — the only two files a host
+         supplies. -->
     <title data-app="name">Labeler</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -294,18 +296,9 @@
          anything defined in plugins/; the shell reaches a pipeline only through
          window.labelerPlugins. `npm run check` enforces it. -->
 
-    <!-- Host identity. The shell is generic; this is the only place that says
-         which application it is. Distinct settingsKey values keep two labelers
-         installed side by side from overwriting each other's preferences. -->
-    <script>
-      window.LABELER_APP = {
-        id: "asoid-desktop",
-        settingsKey: "asoidDesktop_settings",
-        name: "A-SOID Desktop",
-        tagline: "Label, extract pose features, train, and refine animal behavior classifiers.",
-        gate: "A-SOID Desktop keeps your videos, pose files, labels, features, and models together in a project.",
-      };
-    </script>
+    <!-- Host identity: which application this build is. Supplied by the host,
+         not the shell. -->
+    <script src="app.js"></script>
 
     <script src="labeler-plugin.js"></script>
     <script src="project-manager.js"></script>
@@ -321,11 +314,12 @@
     <script src="core/backend.js"></script>
     <script src="core/panels.js"></script>
 
-    <!-- The pipeline. Swapping this one line is what turns the shell into a
-         different application; drop it entirely for the standalone labeler.
-         Its tabs are markup it mounts itself — see core/panels.js — so this
-         page carries only the Label and Active Learning tabs the shell owns. -->
-    <script src="plugins/asoid-pose.js"></script>
+    <!-- The pipeline, supplied by the host under a fixed name. Swapping this
+         one file is what turns the shell into a different application; delete
+         it for the standalone labeler. Its tabs are markup it mounts itself —
+         see core/panels.js — so this page carries only the Label and Active
+         Learning tabs the shell owns. -->
+    <script src="plugins/pipeline.js"></script>
 
     <script src="core/active-learning.js"></script>
     <script src="core/hud.js"></script>
