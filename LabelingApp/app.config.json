@@ -1,5 +1,9 @@
 {
   "title": "A-SOID Desktop",
+  "backend": {
+    "port": 8741,
+    "module": "backend.server:app"
+  },
   "projectDirs": [
     "labels",
     "predictions",
