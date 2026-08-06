@@ -50,7 +50,7 @@ def load_model(checkpoint_path: str) -> dict:
     bundle = joblib.load(checkpoint_path)
     if not isinstance(bundle, dict) or "model" not in bundle:
         raise ValueError(
-            f"{os.path.basename(checkpoint_path)} is not an A-SOID Desktop checkpoint."
+            f"{os.path.basename(checkpoint_path)} is not an IntegratedASOiD checkpoint."
         )
     return bundle
 

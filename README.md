@@ -1,4 +1,4 @@
-# A-SOID Desktop
+# IntegratedASOiD
 
 A desktop application for building **pose-based animal behavior classifiers** — from
 hand-labeling video through training to active-learning refinement.

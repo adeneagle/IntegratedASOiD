@@ -143,7 +143,7 @@ def test_missing_checkpoint_raises():
 def test_non_checkpoint_file_rejected(tmp_path):
     bad = tmp_path / "notamodel.joblib"
     joblib.dump([1, 2, 3], bad)
-    with pytest.raises(ValueError, match="not an A-SOID Desktop checkpoint"):
+    with pytest.raises(ValueError, match="not an IntegratedASOiD checkpoint"):
         inference_service.load_model(str(bad))
 
 

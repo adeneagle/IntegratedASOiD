@@ -15,7 +15,7 @@ feature pipeline and dependency stack are entirely different.
 
 ### What changed from RealtimeASOID
 
-| | RealtimeASOID | A-SOID Desktop |
+| | RealtimeASOID | IntegratedASOiD |
 |---|---|---|
 | Input | video pixels | pose files (x/y/likelihood per body part) |
 | Preprocess | background subtraction + crop + PNG frame dump | likelihood filter + binned pairwise features |

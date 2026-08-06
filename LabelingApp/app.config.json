@@ -1,5 +1,5 @@
 {
-  "title": "A-SOID Desktop",
+  "title": "IntegratedASOiD",
   "backend": {
     "port": 8741,
     "module": "backend.server:app"

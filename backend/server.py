@@ -1,5 +1,5 @@
 """
-FastAPI backend for A-SOID Desktop.
+FastAPI backend for IntegratedASOiD.
 
 Provides endpoints for pose ingestion + feature extraction, RandomForest
 training with active learning, and per-frame inference. Designed to be spawned
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     inference_cancel()
 
 
-app = FastAPI(title="A-SOID Desktop Backend", lifespan=lifespan)
+app = FastAPI(title="IntegratedASOiD Backend", lifespan=lifespan)
 
 # Allow requests from Electron renderer (any localhost port)
 app.add_middleware(

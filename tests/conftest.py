@@ -1,5 +1,5 @@
 """
-Shared fixtures for the A-SOID Desktop test suite.
+Shared fixtures for the IntegratedASOiD test suite.
 
 Provides synthetic pose files (DeepLabCut csv + SLEAP h5), sparse label CSVs in
 the exact format the labeling UI writes, a sample project on disk, and a FastAPI
