@@ -33,7 +33,7 @@ jump-to-worst-frame and relabel strip all work as before.
 
 ```
 ├── LabelingApp/           # Electron app. Four files are ours; the rest is the
-│   │                      # @asoid/labeling-shell package (see the section below).
+│   │                      # behavior-labeler package (see the section below).
 │   ├── app.js             # OURS — which application this is
 │   ├── app.config.json    # OURS — window title, project folder layout
 │   ├── plugins/pipeline.js# OURS — the whole A-SOID pipeline: Pose/Train/Predict
@@ -134,7 +134,7 @@ so counting it would inflate F1.
 
 `LabelingApp/` used to be a 6,000-line `renderer.js` maintained as two drifting
 copies, one here and one in RealtimeASOID. The shell is now its own repo,
-`@asoid/labeling-shell`, which both projects consume and which also runs
+`behavior-labeler`, which both projects consume and which also runs
 standalone as a bout labeler with no model behind it.
 
 **Only four files in `LabelingApp/` belong to this project**: `app.js`,
