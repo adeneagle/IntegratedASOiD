@@ -2,11 +2,21 @@
 
 ## Project Overview
 
-Pose-based animal behavior classifier with active learning. An Electron desktop
-app for labeling video with behavioral bouts, backed by a FastAPI server that
+Pose-based animal behavior classifier with active learning. A FastAPI server
 extracts spatio-temporal features from pose-estimation files (DeepLabCut /
 SLEAP / OpenMonkeyStudio), trains a RandomForest through A-SOID's
 active-learning loop, and returns per-frame predictions with uncertainty.
+
+Two UI shells consume that same backend:
+
+- **`gui/` (PySide6, Python)** — the current, actively developed shell, on
+  branch `python-rewrite`. Port of RealtimeASOID's completed Python rewrite
+  (`RealtimeASOID-python/python-rewrite` branch) to the pose/RF pipeline. No
+  Electron, no npm. See [gui/README.md](gui/README.md) for architecture and
+  `pixi run gui` to run it.
+- **`LabelingApp/` (Electron)** — the original shell, kept on `main` as a
+  restore point (mirrors how RealtimeASOID kept its Electron baseline while
+  porting). Not being extended further; new work goes into `gui/`.
 
 **This is a fork of RealtimeASOID** with the TSM convolutional network replaced
 by [A-SOID](https://github.com/YttriLab/A-SOID)'s random-forest + active-learning
@@ -61,14 +71,22 @@ jump-to-worst-frame and relabel strip all work as before.
 
 ```bash
 pixi install
-cd LabelingApp && npm install && npm start
+pixi run gui
 ```
 
-Electron spawns `uvicorn backend.server:app --port 8741` automatically and tears
-it down on exit. `main.js::resolveBackendPython()` resolves the interpreter:
-**`RTASOID_PYTHON`/`PYTHON` override → project-local pixi env → bare `python`**.
-`GET /api/health` reports the interpreter plus numpy/sklearn/numba versions.
-Standalone backend: `pixi run backend`. Tests: `pixi run test`.
+`pixi install` materializes both environments defined in `pixi.toml`: `default`
+(backend, scikit-learn/FastAPI) and `gui` (PySide6 frontend) — one lockfile,
+no separate venv. The GUI spawns `uvicorn backend.server:app --port 8741`
+locally and tears it down on exit; `gui/labeling_shell/backend/process.py::resolve_python()`
+resolves the interpreter: **`ASOID_PYTHON`/`PYTHON` override → project-local
+pixi env (`.pixi/envs/default/python.exe`) → bare `python`**. `GET /api/health`
+reports the interpreter plus numpy/sklearn/numba versions.
+
+Standalone backend: `pixi run backend`. Tests: `pixi run test` (backend),
+`pixi run -e gui python gui/run_all_tests.py` (frontend, headless).
+
+The legacy Electron shell still runs via `cd LabelingApp && npm install && npm start`,
+but new work goes into `gui/` — see the shells comparison above.
 
 There is **no GPU dependency** — the environment installs and runs identically
 on any machine.

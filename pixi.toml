@@ -1,12 +1,15 @@
-# pixi project definition — the reproducible Python environment for the backend.
+# pixi project definition — the reproducible Python environments for both the
+# backend and the PySide6 frontend, in one lockfile.
 #
-# This is the source of truth for the Python side. It pulls ffmpeg and the
-# native scientific stack from conda-forge into a project-local env at a
-# deterministic path (.pixi/envs/default), which the Electron app auto-discovers.
+# Two environments, solved independently so the GUI never drags in
+# scikit-learn/numba:
+#   default — the FastAPI/scikit-learn backend (.pixi/envs/default)
+#   gui     — the PySide6 desktop app (.pixi/envs/gui)
 #
-#   pixi install        # materialize/pin the env (writes pixi.lock) + downloads
-#   pixi run backend    # run the FastAPI backend standalone
-#   pixi run test       # run the pytest suite
+#   pixi install         # materialize/pin BOTH envs (writes pixi.lock) + downloads
+#   pixi run gui          # launch the app
+#   pixi run backend     # run the FastAPI backend standalone
+#   pixi run test         # run the pytest suite
 #
 # The classifier is a scikit-learn RandomForest over pose-derived features, so
 # there is no GPU dependency and no CUDA build to choose — this env installs and
@@ -15,26 +18,37 @@
 [project]
 name = "asoid-desktop"
 version = "0.1.0"
-description = "Pose-based animal behavior classifier with active learning (Electron GUI + FastAPI/scikit-learn backend)."
+description = "Pose-based animal behavior classifier with active learning (PySide6 GUI + FastAPI/scikit-learn backend)."
 channels = ["conda-forge"]
 platforms = ["win-64"]   # add "linux-64" / "osx-64" here, then re-run `pixi install`
 
-[tasks]
+[dependencies]
+# Shared by both environments — kept minimal so the gui environment stays
+# free of scikit-learn/numba. Everything backend-specific lives under
+# [feature.backend], everything gui-specific under [feature.gui]. Python
+# itself is NOT shared: pixi merges (doesn't override) feature deps with
+# these, so each feature pins its own version below instead.
+numpy = "*"
+
+[feature.backend]
+[feature.backend.tasks]
 backend = "uvicorn backend.server:app --port 8741 --host 127.0.0.1"
 test = "pytest"
 
-[dependencies]
-python = "3.12.*"
+[feature.backend.dependencies]
+# scikit-learn<1.3 has no conda-forge build past Python 3.11, so the backend
+# pins its own Python here (the gui environment, which has no such
+# constraint, pins its own 3.12 below).
+python = "3.11.*"
 # Classifier + feature extraction. scikit-learn is pinned below 1.3 to match
 # upstream A-SOID, so RandomForest models pickled by either app load in both.
 scikit-learn = "<1.3"
 numba = ">=0.52"
 joblib = "*"
-numpy = "*"
 pandas = "*"
 scipy = "*"
 h5py = "*"          # SLEAP .h5 pose files + .rlt project bundles
-# Video / IO (labeling playback is Electron-side; these are for labeled-video export)
+# Video / IO (labeling playback is gui-side; these are for labeled-video export)
 opencv = "*"
 ffmpeg = "*"
 matplotlib = "*"
@@ -46,3 +60,22 @@ pyyaml = "*"
 pytest = "*"
 pytest-asyncio = "*"
 httpx = "*"
+
+# The PySide6 desktop app. No scikit-learn/numba — this environment installs
+# (and solves) even on a machine that only ever runs the GUI against a remote
+# backend.
+[feature.gui.tasks]
+gui = "python gui/app.py"
+
+[feature.gui.dependencies]
+python = "3.12.*"
+pyside6 = ">=6.7"
+av = ">=12"   # PyAV: frame-accurate decode via ffmpeg/libav
+
+[feature.gui.pypi-dependencies]
+httpx = ">=0.27"
+pyinstaller = "*"   # gui/packaging/ — desktop bundle build only
+
+[environments]
+default = { features = ["backend"] }
+gui = { features = ["gui"] }
