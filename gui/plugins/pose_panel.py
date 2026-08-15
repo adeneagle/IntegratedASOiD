@@ -56,18 +56,22 @@ class _Base(QtWidgets.QWidget):
             self.ctx.status("Connect a backend first (Backend menu).")
         return c
 
-    def _spawn_call(self, fn, on_done):
+    def _spawn_call(self, fn, on_done, on_fail=None):
         w = CallWorker(fn)
         w.done.connect(on_done)
         w.failed.connect(self.ctx.status)
+        if on_fail:
+            w.failed.connect(on_fail)
         w.finished.connect(lambda: self._workers.discard(w))
         self._workers.add(w)
         w.start()
 
-    def _spawn_stream(self, make_iter, on_event, on_done=None):
+    def _spawn_stream(self, make_iter, on_event, on_done=None, on_fail=None):
         w = StreamWorker(make_iter)
         w.event.connect(on_event)
         w.failed.connect(self.ctx.status)
+        if on_fail:
+            w.failed.connect(on_fail)
         if on_done:
             w.finished_ok.connect(on_done)
         w.finished.connect(lambda: self._workers.discard(w))
@@ -187,6 +191,11 @@ class PoseTab(_Base):
             self.videos_list.addItem(item)
         pose = self.ctx.pose_path()
         self.pose_path_label.setText(pose or "(none)")
+        self.bodyparts_list.clear()
+        self.animals_list.clear()
+        self._n_frames = None
+        if pose:
+            self._inspect(pose)
 
     # -------------------------------------------------------------- attach
     def _attach_pose(self) -> None:
@@ -246,11 +255,23 @@ class PoseTab(_Base):
     def _extract(self) -> None:
         client = self._client()
         pm = self.ctx.project_manager()
-        if not client or pm is None:
+        if client is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Can't extract features",
+                "No backend connection. Connect a backend first (Backend menu).")
+            return
+        if pm is None:
+            msg = ("No project is open. Features are written into the project "
+                   "folder, so create or open a project first (File menu).")
+            self.ctx.status(msg)
+            QtWidgets.QMessageBox.warning(self, "Can't extract features", msg)
             return
         bodyparts = self._checked_texts(self.bodyparts_list)
         if len(bodyparts) < 2:
-            self.ctx.status("Select at least two body parts.")
+            msg = ("Select at least two body parts." if self.bodyparts_list.count()
+                   else "No body parts loaded. Attach a pose file first.")
+            self.ctx.status(msg)
+            QtWidgets.QMessageBox.warning(self, "Can't extract features", msg)
             return
         selected_ids = set()
         videos = []
@@ -269,6 +290,7 @@ class PoseTab(_Base):
             })
         if not videos:
             self.ctx.status("No videos selected.")
+            QtWidgets.QMessageBox.warning(self, "Can't extract features", "No videos selected.")
             return
 
         iteration_dir = self.current_iteration_dir()
@@ -286,17 +308,27 @@ class PoseTab(_Base):
         self.stop_btn.setEnabled(True)
         self.progress.setValue(0)
 
+        task_error = {"msg": None}
+
         def on_event(ev: dict):
             total, prog = ev.get("total") or 0, ev.get("progress") or 0
             if total:
                 self.progress.setMaximum(total)
                 self.progress.setValue(prog)
-            if ev.get("status") in ("completed", "error", "cancelled"):
-                self.log.appendPlainText(f"[extract] {ev.get('status')}")
+            status = ev.get("status")
+            if status in ("completed", "error", "cancelled"):
+                self.log.appendPlainText(f"[extract] {status}")
+            if status == "error":
+                task_error["msg"] = ev.get("error") or "Extraction failed."
 
         def on_done():
             self.extract_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            if task_error["msg"]:
+                self.ctx.status("Extraction failed.")
+                QtWidgets.QMessageBox.critical(
+                    self, "Feature extraction failed", task_error["msg"])
+                return
             pm.set_iteration_meta(iteration_dir, {
                 "label_signature": self.label_signature(
                     [e for e in pm.manifest.get("videos", []) if e.get("id") in selected_ids]),
@@ -304,13 +336,21 @@ class PoseTab(_Base):
             })
             self.ctx.status("Extraction finished.")
 
+        def on_fail(msg: str):
+            self.extract_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.log.appendPlainText(f"[extract] failed: {msg}")
+            QtWidgets.QMessageBox.critical(self, "Feature extraction failed", msg)
+
         def start(res: dict):
             self._task_id = res.get("task_id")
-            if self._task_id:
-                self._spawn_stream(
-                    lambda: client.extraction_status(self._task_id), on_event, on_done)
+            if not self._task_id:
+                on_fail(f"Backend did not return a task id: {res}")
+                return
+            self._spawn_stream(
+                lambda: client.extraction_status(self._task_id), on_event, on_done, on_fail)
 
-        self._spawn_call(lambda: client.extract_features(req), start)
+        self._spawn_call(lambda: client.extract_features(req), start, on_fail)
 
     def _stop(self) -> None:
         client = self._client()

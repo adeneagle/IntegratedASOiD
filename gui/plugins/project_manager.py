@@ -73,7 +73,27 @@ class PoseProjectManager(ProjectStore):
         if self._save_timer is not None:
             self._save_timer.stop()
         # _manifest is mutated in place by the setters below, then flushed here.
-        self._write_manifest(self._manifest)
+        self._write_manifest(self.manifest)
+
+    # ProjectStore's writers re-read project.json from disk, mutate, and write
+    # back — which would clobber (and be clobbered by) the cached _manifest this
+    # class keeps. Route them through the cache so there is a single writer.
+    def register_video(self, video_id, name, path, frame_count=None) -> None:
+        videos = self.manifest.setdefault("videos", [])
+        record = {"id": video_id, "name": name, "path": str(path),
+                  "frame_count": frame_count}
+        existing = next((v for v in videos if v.get("id") == video_id), None)
+        if existing:
+            existing.update(record)
+        else:
+            videos.append(record)
+        self.flush_manifest()
+
+    def save_behaviors(self, behaviors) -> None:
+        self.manifest["behaviors"] = [
+            b if isinstance(b, dict) else vars(b) for b in behaviors
+        ]
+        self.flush_manifest()
 
     def _load(self) -> dict:
         self._manifest = self.load_manifest()
