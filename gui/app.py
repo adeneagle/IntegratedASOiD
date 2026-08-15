@@ -192,6 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_model_changed(self) -> None:
         self._refresh_all()
         self._recompute_misclassified()
+        self._update_hud(self.player.index)
         self._autosave()
 
     def _autosave(self) -> None:
@@ -272,14 +273,14 @@ class MainWindow(QtWidgets.QMainWindow):
         b = self.model.bout_at_frame(frame)
         human = b.behavior_name if b else None
         info = hud_info(self._al_state, frame, human)
-        if self._al_state is None or info["predicted"] is None:
+        if info["predicted"] is None and not info["label"]:
             self.hud.hide()
             return
-        text = f"pred: {info['predicted']}"
-        if info["confidence"] is not None:
-            text += f"  ({info['confidence']:.2f})"
-        if info["label"]:
-            text += f"\nlabel: {info['label']}"
+        text = f"label: {info['label']}" if info["label"] else "label: —"
+        if info["predicted"] is not None:
+            text += f"\npred: {info['predicted']}"
+            if info["confidence"] is not None:
+                text += f"  ({info['confidence']:.2f})"
         color = "#ff5555" if info["mismatch"] else "#ffffff"
         self.hud.setText(text)
         self.hud.setStyleSheet(
