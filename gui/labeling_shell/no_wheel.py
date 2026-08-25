@@ -24,12 +24,24 @@ class _NoWheelMixin:
             event.ignore()
 
 
-class NoWheelComboBox(_NoWheelMixin, QtWidgets.QComboBox):
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """A combo box that never changes its current item on the wheel.
+
+    Qt's default QComboBox.wheelEvent cycles the selected item on any hover
+    scroll, popup open or not. That's fine for a lone dropdown, but inside a
+    scrolling table it silently reassigns whatever row happens to be under the
+    cursor. The fix is to always ignore the wheel on the closed control — the
+    event then propagates to the scroll area instead. This does not affect
+    scrolling within the popup list itself once it's open: that list is a
+    separate top-level widget with its own wheel handling, untouched here.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Without this the widget takes focus on wheel-over and then happily
-        # consumes the next scroll.
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        event.ignore()
 
 
 class NoWheelSpinBox(_NoWheelMixin, QtWidgets.QSpinBox):

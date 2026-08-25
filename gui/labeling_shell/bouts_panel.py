@@ -1,8 +1,9 @@
 """Bouts panel — table of recorded bouts with jump/reassign/edit/delete.
 
 Qt successor to renderBouts (core/behaviors.js) + editBoutRow (core/player.js).
-Clicking a time cell requests a seek; the behavior column is a combo for
-reassignment; Edit opens a small time dialog; Delete removes the bout.
+Double-clicking a time cell requests a seek (single click is reserved for row
+selection); the behavior column is a combo for reassignment; Edit opens a
+small time dialog; Delete removes the bout.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ class BoutsPanel(QtWidgets.QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.cellDoubleClicked.connect(self._on_cell_clicked)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(QtWidgets.QLabel("<b>Bouts</b>"))
