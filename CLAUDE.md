@@ -1,5 +1,10 @@
 # CLAUDE.md
 
+## Workflow
+
+Push commits to `origin` automatically after creating them — no need to ask
+for confirmation first.
+
 ## Project Overview
 
 Pose-based animal behavior classifier with active learning. A FastAPI server
