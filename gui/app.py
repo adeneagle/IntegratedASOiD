@@ -8,7 +8,7 @@ backend (pose feature extraction + RandomForest active learning).
 Keyboard: 1-0 toggle behavior bouts at the current frame, Space play/pause,
 Left/Right step, F fullscreen — same shortcuts as the Electron app.
 
-    .venv-gui/Scripts/python.exe gui/app.py [video]
+    pixi run gui            (or: pixi run -e gui python gui/app.py [video])
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bouts_panel.changed.connect(self._on_model_changed)
         self.bouts_panel.seekRequested.connect(self._seek)
         self.pipeline = PipelinePanel(self)  # MainWindow is the pipeline ctx
+        self.pipeline.pose.selectionChanged.connect(self._on_pose_selection_changed)
 
         label_tab = QtWidgets.QWidget()
         ll = QtWidgets.QVBoxLayout(label_tab)
@@ -138,6 +139,8 @@ class MainWindow(QtWidgets.QMainWindow):
         fm.addSeparator()
         fm.addAction("New Project…", self.new_project)
         fm.addAction("Open Project…", self.open_project)
+        self.videos_menu = fm.addMenu("Project Videos")
+        self.videos_menu.aboutToShow.connect(self._populate_videos_menu)
         fm.addSeparator()
         fm.addAction("Export .rlt…", self.export_rlt)
         fm.addAction("Import .rlt…", self.import_rlt)
@@ -184,10 +187,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pose_overlay.set_current_frame(idx)
 
     def _on_overlay_toggled(self, checked: bool) -> None:
+        if checked and not self._load_overlay():
+            self.overlay_chk.blockSignals(True)
+            self.overlay_chk.setChecked(False)
+            self.overlay_chk.blockSignals(False)
+            checked = False
         self.pose_overlay.set_enabled(checked)
-        if checked:
-            bodyparts = self.pipeline.pose._checked_texts(self.pipeline.pose.bodyparts_list)
-            self.pose_overlay.ensure_loaded(bodyparts)
+
+    def _load_overlay(self, quiet: bool = False) -> bool:
+        pose = self.pipeline.pose
+        return self.pose_overlay.ensure_loaded(
+            pose.selected_bodyparts(), pose.pose_settings(), quiet=quiet)
+
+    def _on_pose_selection_changed(self) -> None:
+        self.pose_overlay.invalidate()
+        if self.overlay_chk.isChecked():
+            self._load_overlay(quiet=True)
 
     def _on_model_changed(self) -> None:
         self._refresh_all()
@@ -198,6 +213,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _autosave(self) -> None:
         if self.project and self.current_video_id:
             self.project.save_video_labels(self.current_video_id, self.model)
+
+    def _update_title(self) -> None:
+        title = "IntegratedASOiD — Labeler"
+        if self.project:
+            title += f" — {self.project.manifest.get('name') or self.project.root.name}"
+        if self._video_path:
+            title += f" — {Path(self._video_path).name}"
+        self.setWindowTitle(title)
 
     def _status(self, msg: str) -> None:
         self.statusBar().showMessage(msg, 5000)
@@ -222,15 +245,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.project
 
     def pose_path(self):
-        if self.project and self.current_video_id:
-            return self.project.get_video_pose(self.current_video_id)
-        return None
+        return self.pipeline.pose.pose_path_for(self.current_video_id)
+
+    def video_frame_count(self):
+        return self.player.reader.num_frames if self.player.reader else None
+
+    def save_labels(self):
+        self._autosave()
 
     def checkpoint_dir(self):
         return str(self.project.checkpoint_dir()) if self.project else None
-
-    def pose_iteration_dir(self):
-        return self.pipeline.pose.current_iteration_dir()
 
     def status(self, msg):
         self._status(msg)
@@ -250,12 +274,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.set_threshold(t)
 
     def set_al_results(self, state):
+        """Show a video's predictions — or, with None, clear the last video's."""
         self._al_state = state
         if self.player.reader is not None:
             n = self.player.reader.num_frames
+        elif state is not None and state.by_index:
+            n = max(state.by_index) + 1
         else:
-            n = (max(state.by_index) + 1) if state.by_index else 0
+            n = 0
         self.timeline.set_data(state, n)
+        if state is None:
+            self.timeline.set_misclassified(())
         self._recompute_misclassified()
         self._update_hud(self.player.index)
 
@@ -299,7 +328,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def load_video(self, path: str) -> None:
         self._autosave()
-        self.pose_overlay.reset_for_video()
+        self.pose_overlay.invalidate()
         self.player.load(path)
         self._video_path = path
         name = Path(path).name
@@ -307,9 +336,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.project:
             self.model = self.project.load_into_model(self.current_video_id)
             self._rebind_model()
+            self.project.manifest["last_video"] = self.current_video_id
             self.project.register_video(
                 self.current_video_id, name, path, self.player.reader.num_frames)
         self._refresh_all()
+        # Repoints the pose file and restores (or clears) this video's saved
+        # predictions, so one video's uncertainty never draws over another's.
+        self.pipeline.on_video_switched()
+        if self.overlay_chk.isChecked():
+            self._load_overlay(quiet=True)
+        self._update_title()
         self._status(f"Loaded {name} — {self.player.reader.num_frames} frames")
 
     # --------------------------------------------------------------- keyboard
@@ -399,8 +435,24 @@ class MainWindow(QtWidgets.QMainWindow):
         name, ok = QtWidgets.QInputDialog.getText(self, "Project name", "Name:")
         if not ok:
             return
-        self.project = PoseProjectManager(d)
-        self.project.create(name or Path(d).name)
+        store = PoseProjectManager(d)
+        if store.exists():
+            QtWidgets.QMessageBox.warning(
+                self, "Already a project",
+                "That folder already holds a project — use File ▸ Open Project.")
+            return
+        store.create(name or Path(d).name)
+        self.project = store
+        # Labels made before the project existed belong in it.
+        if self._video_path and self.current_video_id:
+            store.register_video(self.current_video_id, Path(self._video_path).name,
+                                 self._video_path, self.video_frame_count())
+            pose = self.pipeline.pose._pose_by_video.get(self.current_video_id)
+            if pose:
+                store.set_video_pose(self.current_video_id, pose)
+                store.flush_manifest()
+            self._autosave()
+        self._project_opened()
         self._status(f"Project created at {d}")
 
     def open_project(self) -> None:
@@ -411,13 +463,54 @@ class MainWindow(QtWidgets.QMainWindow):
         if not store.exists():
             QtWidgets.QMessageBox.warning(self, "Not a project", "No project.json found.")
             return
+        self._autosave()
+        self._set_project(store)
+        # Pick up where the user left off: the video open when they last worked
+        # in this project, else the first one still on disk.
+        videos = store.manifest.get("videos") or []
+        last = store.manifest.get("last_video")
+        candidates = sorted(videos, key=lambda v: v.get("id") != last)
+        for v in candidates:
+            if v.get("path") and os.path.exists(v["path"]):
+                self.load_video(v["path"])
+                break
+        self._status(f"Opened project {store.manifest.get('name')} — {len(videos)} video(s); "
+                     f"switch with File ▸ Project Videos.")
+
+    def _set_project(self, store: PoseProjectManager) -> None:
+        """Make `store` the active project with no video loaded from it yet."""
         self.project = store
         self.model = LabelModel()
-        self.model.behaviors = [Behavior(**b) for b in store.load_manifest().get("behaviors", [])]
+        self.model.behaviors = [Behavior(**b) for b in store.manifest.get("behaviors", [])]
         self.current_video_id = None
+        self._video_path = None
         self._rebind_model()
+        self.set_al_results(None)
+        self._project_opened()
+
+    def _project_opened(self) -> None:
         self._refresh_all()
-        self._status(f"Opened project {store.load_manifest().get('name')}")
+        self.pipeline.on_project_opened()
+        self._update_title()
+
+    def _populate_videos_menu(self) -> None:
+        self.videos_menu.clear()
+        videos = (self.project.manifest.get("videos") or []) if self.project else []
+        if not videos:
+            act = self.videos_menu.addAction("(open a project with videos)")
+            act.setEnabled(False)
+            return
+        for v in videos:
+            path = v.get("path")
+            label = v.get("name") or v.get("id")
+            if v.get("id") == self.current_video_id:
+                label = "● " + label
+            act = self.videos_menu.addAction(label)
+            if path and os.path.exists(path):
+                act.triggered.connect(lambda _c=False, p=path: self.load_video(p))
+            else:
+                act.setText(label + "  (file not found)")
+                act.setEnabled(False)
 
     # ------------------------------------------------------------------- rlt
     def export_rlt(self) -> None:
@@ -428,14 +521,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if client is None:
             self._status("Connect a backend first (Backend menu).")
             return
-        default_name = (self.project.load_manifest().get("name") or "project") + ".rlt"
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Export .rlt")
+        box.setText("What should the bundle contain?")
+        box.setInformativeText(
+            "Labels only: the manifest and labels — small, for sharing annotations.\n"
+            "Full package: also pose files, features, predictions and models, so the "
+            "project trains and predicts on another machine as-is.")
+        light = box.addButton("Labels only", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        full = box.addButton("Full package", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() not in (light, full):
+            return
+        package = box.clickedButton() is full
+        default_name = (self.project.manifest.get("name") or "project") + ".rlt"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export .rlt", default_name, "RLT bundle (*.rlt)")
         if not path:
             return
+        self._autosave()
         self._status("Exporting .rlt…")
         self._spawn_bg(
-            lambda: self.project.export_rlt(client, path),
+            lambda: self.project.export_rlt(client, path, package=package),
             lambda res: self._status(f"Exported {path}"),
         )
 
@@ -457,13 +565,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return PoseProjectManager.import_rlt(client, rlt_path, out_dir)
 
         def on_done(pm: PoseProjectManager) -> None:
-            self.project = pm
-            self.model = LabelModel()
-            self.model.behaviors = [Behavior(**b) for b in pm.load_manifest().get("behaviors", [])]
-            self.current_video_id = None
-            self._rebind_model()
-            self._refresh_all()
-            self._status(f"Imported project into {out_dir}")
+            self._set_project(pm)
+            self._status(f"Imported project into {out_dir} — videos need re-linking: "
+                         f"open each with File ▸ Open Video.")
 
         self._spawn_bg(do_import, on_done)
 
@@ -484,6 +588,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def done(ok: bool) -> None:
             if ok:
                 self._status("Backend ready.")
+                self.pipeline.on_backend_ready()
             else:
                 # Don't leave a dead Backend attached: the pipeline tabs check
                 # ctx.client() for None to decide whether to prompt.
@@ -502,10 +607,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.disconnect_backend()
         self.backend = Backend(BackendConfig.remote(host.strip()))
         self._status(f"Connecting to {host}…")
-        self._spawn_bg(
-            lambda: self.backend.start(wait=True, timeout=20),
-            lambda ok: self._status("Backend reachable." if ok else "Backend not reachable."),
-        )
+        def done(ok: bool) -> None:
+            self._status("Backend reachable." if ok else "Backend not reachable.")
+            if ok:
+                self.pipeline.on_backend_ready()
+
+        self._spawn_bg(lambda: self.backend.start(wait=True, timeout=20), done)
 
     def disconnect_backend(self) -> None:
         if self.backend is not None:
@@ -515,6 +622,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._autosave()
+        if self.project:
+            self.project.flush_manifest()
         self.disconnect_backend()
         super().closeEvent(event)
 

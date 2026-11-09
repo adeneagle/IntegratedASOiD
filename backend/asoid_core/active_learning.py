@@ -95,6 +95,9 @@ class RFActiveLearner:
         max_samples_iter: samples added per iteration.
         conf_threshold: a sample is "low confidence" below this max probability.
         exclude_other: drop the "other" class from training entirely.
+        has_other: False when the last class is a real class rather than
+            "unlabeled" — a binarized run's negatives. Every class is then
+            scored and eligible for refinement, and exclude_other is moot.
     """
 
     def __init__(
@@ -107,6 +110,7 @@ class RFActiveLearner:
         max_samples_iter: int = 20,
         conf_threshold: float = 0.5,
         exclude_other: bool = False,
+        has_other: bool = True,
     ):
         self.features = np.asarray(features)
         self.targets = np.asarray(targets)
@@ -116,8 +120,12 @@ class RFActiveLearner:
         self.max_samples_iter = max_samples_iter
         self.conf_threshold = conf_threshold
         self.exclude_other = exclude_other
-        # "other" is by construction the last class code.
-        self.label_code_other = max(np.arange(len(class_names))) if class_names else 0
+        # "other" is by construction the last class code; -1 matches no class.
+        if has_other:
+            self.label_code_other = max(np.arange(len(class_names))) if class_names else 0
+        else:
+            self.label_code_other = -1
+            self.exclude_other = False
 
         self.features_train = None
         self.features_heldout = None
@@ -226,7 +234,18 @@ class RFActiveLearner:
         })
 
         # 2. Seed model — init_ratio of each class.
-        samples2train = [int(np.sum(self.targets_train == c) * self.init_ratio) for c in unique_classes]
+        # UPSTREAM FIX: upstream seeds int(n * init_ratio) per class, which is 0
+        # for any class with fewer than 1/init_ratio training rows (< 100 at the
+        # default 0.01). Hand-labeled behaviors are routinely that sparse, so
+        # they were left out of the seed entirely: either "seeds only one
+        # class", or a seed that is nearly all "other", confidently predicts
+        # "other" for every behavior sample, finds nothing low-confidence and
+        # "converges" at round 0 with F1 ~0. Seeding at least one sample per
+        # class only changes the cases where upstream dropped the class.
+        class_counts = [int(np.sum(self.targets_train == c)) for c in unique_classes]
+        samples2train = [
+            min(n, max(1, int(n * self.init_ratio))) for n in class_counts
+        ]
         X_seed, Y_seed = [], []
         for n_samples, c in zip(samples2train, unique_classes):
             if n_samples > 0:

@@ -148,6 +148,64 @@ def test_mainwindow_al_results_drive_timeline_and_hud():
             win.player.reader.close()
 
 
+def test_switching_videos_drops_the_previous_videos_predictions():
+    """Regression: AL state outlived a video switch, so one video's uncertainty
+    timeline and HUD were drawn over another's."""
+    _app()
+    from app import MainWindow
+    from labeling_shell.active_learning import AlState
+    win = MainWindow(autostart_backend=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        a, b = os.path.join(d, "a.mp4"), os.path.join(d, "b.mp4")
+        write_index_video(a, 30, fps=30, gop=12)
+        write_index_video(b, 20, fps=30, gop=12)
+        win.load_video(a)
+        state = AlState()
+        state.load_results({"class_names": ["x", "other"],
+                            "frames": [{"index": 5, "predicted_class": 0, "uncertainty": 0.9}]})
+        win.set_al_results(state)
+        assert win.al_state() is state
+        win.load_video(b)
+        assert win.al_state() is None
+        assert win.timeline.al_state is None and not win.timeline.misclassified
+        assert win.timeline.num_frames == 20
+        win.player.reader.close()
+
+
+def test_new_project_adopts_the_open_video_and_its_labels():
+    _app()
+    from app import MainWindow
+    from PySide6 import QtWidgets
+    win = MainWindow(autostart_backend=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        path = os.path.join(d, "clip.mp4")
+        write_index_video(path, 30, fps=30, gop=12)
+        win.load_video(path)
+        win.behaviors_panel.add_behavior("groom")
+        win._seek(2)
+        win._handle_key("1", 0)
+        win._seek(6)
+        win._handle_key("1", 0)
+
+        proj = os.path.join(d, "proj")
+        orig_dir, orig_text = (QtWidgets.QFileDialog.getExistingDirectory,
+                               QtWidgets.QInputDialog.getText)
+        QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: proj)
+        QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **k: ("p", True))
+        try:
+            win.new_project()
+        finally:
+            QtWidgets.QFileDialog.getExistingDirectory = orig_dir
+            QtWidgets.QInputDialog.getText = orig_text
+
+        vid = sanitize_id("clip.mp4")
+        assert win.project.get_video_entry(vid) is not None
+        assert win.project.get_video_frame_count(vid) == 30
+        assert len(win.project.load_into_model(vid).bouts) == 1
+        assert "p" in win.windowTitle()
+        win.player.reader.close()
+
+
 def test_mainwindow_pipeline_tabs_present():
     _app()
     from app import MainWindow
@@ -226,6 +284,63 @@ def test_bout_behavior_combo_ignores_the_wheel():
 
     assert combo.currentText() == "groom"      # unchanged
     assert m.bouts[0].behavior_name == "groom"  # and not reassigned
+
+
+def test_pose_overlay_fetches_only_the_videos_frames_and_draws():
+    """A session-length pose file against a short clip: the overlay must ask for
+    the clip's frames only (the whole file can outlast the client timeout), and
+    then actually paint keypoints over the frame."""
+    import time
+
+    app = _app()
+    from app import MainWindow
+
+    calls = []
+
+    class FakeClient:
+        def pose_keypoints(self, pose_path, bodyparts, end=None, **_kw):
+            calls.append(end)
+            n = end or 100000
+            return {"bodyparts": bodyparts, "start": 0, "n_frames": n, "points": [
+                {"name": b, "x": [80.0 + 60 * i] * n, "y": [120.0] * n,
+                 "likelihood": [0.99] * n} for i, b in enumerate(bodyparts)]}
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: {}
+
+    win = MainWindow(autostart_backend=False)
+    win.client = lambda: FakeClient()
+    win.resize(900, 700)
+    win.show()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        path = os.path.join(d, "clip.mp4")
+        write_index_video(path, 60, fps=30, gop=12)
+        win.load_video(path)
+        pose = win.pipeline.pose
+        pose._pose_by_video[win.current_video_id] = os.path.join(d, "session.h5")
+        pose._on_inspected({"bodyparts": ["nose", "tail"], "animals": [], "n_frames": 100000})
+
+        win.overlay_chk.setChecked(True)
+        deadline = time.time() + 10
+        while win.pose_overlay._payload is None and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        assert calls and calls[-1] == 60, f"requested end={calls}"
+        assert win.overlay_chk.isChecked()
+
+        win._seek(5)
+        app.processEvents()
+        img = win.player.view.grab().toImage()
+        cyan = sum(
+            1 for x in range(img.width()) for y in range(img.height())
+            if (lambda c: c.blue() > 200 and c.green() > 180 and c.red() < 140)(
+                img.pixelColor(x, y)))
+        assert cyan > 0, "overlay painted nothing"
+
+        win.overlay_chk.setChecked(False)
+        if win.player.reader is not None:
+            win.player.reader.close()
+    win.close()
 
 
 def _main() -> int:

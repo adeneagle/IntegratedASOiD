@@ -76,10 +76,15 @@ class AlState:
 
     def confidence(self, idx: int) -> Optional[float]:
         fi = self.frame_info(idx)
-        preds = fi.get("predictions") if fi else None
+        if not fi:
+            return None
+        preds = fi.get("predictions")
         if isinstance(preds, (list, tuple)) and preds:
             return float(max(preds))
-        return None
+        # Backends that send only a normalized-entropy uncertainty (the pose/RF
+        # one does): confidence is its complement.
+        u = fi.get("uncertainty")
+        return 1.0 - float(u) if u is not None else None
 
     def uncertainty(self, idx: int) -> Optional[float]:
         fi = self.frame_info(idx)

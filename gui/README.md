@@ -40,11 +40,14 @@ labeling_shell/                shell, copied from RealtimeASOID-python (generic)
 plugins/                       the pose/RF pipeline (app-specific):
   pose_panel.py                 Pose tab — attach/inspect pose, bodyparts,
                                  extract features, iteration bookkeeping
-  train_panel.py                Train tab — active-learning hyperparameters
+  train_panel.py                Train tab — active-learning hyperparameters,
+                                 positive-class checklist, live metrics
   predict_panel.py              Predict tab — batch inference
-  active_learning_panel.py      run inference on the current video, review
-  pipeline_config.py            pure request-body builders (Qt-free)
-  pipeline_panel.py             QTabWidget container wiring the four above
+  active_learning_panel.py      run inference on the current video, review,
+                                 per-video saved predictions
+  common.py                     _Base (worker threads), checklists, ModelPicker
+  pipeline_config.py            pure helpers + request-body builders (Qt-free)
+  pipeline_panel.py             QTabWidget container + lifecycle fan-out
   project_manager.py            PoseProjectManager — pose/model/iteration
                                  bookkeeping on top of ProjectStore
   pose_overlay.py                pose-skeleton dots painted over the video
@@ -55,19 +58,49 @@ tools/index_video.py            synthetic frame-indexed test videos
 
 ## Workflow
 
-1. **Label** — load a video, define behaviors, mark temporal bouts.
-2. **Pose** — attach the video's pose file, pick body parts/animals, set
-   likelihood threshold and minimum behavior duration, extract features.
-3. **Train** — RandomForest + active learning: seed on `init_ratio` of each
+1. **Project** — File ▸ New Project (a video already open is adopted, labels
+   and all). Reopening a project loads the video you last worked on; switch
+   with File ▸ Project Videos.
+2. **Label** — define behaviors, mark temporal bouts (keys `1`–`0`).
+3. **Pose** — attach the video's pose file. Body parts default to all; the
+   tab shows the feature width and bin size, warns if the pose file and video
+   cover different frame counts, and reads the frame rate from the video.
+   Extract features into the current iteration.
+4. **Train** — RandomForest + active learning: seed on `init_ratio` of each
    class, then repeatedly add the samples the model is least sure about
-   until it stops being confused. Saves a `.joblib` bundle.
-4. **Active Learning** — run inference on the current video's pose file, get
-   an uncertainty heatmap on the timeline, jump to the least-confident
-   frames, relabel in place.
-5. **Predict** — apply a model to unlabeled pose files in batch.
+   until it stops being confused. The model lands in `iteration-N/models/`,
+   is recorded in the manifest, and is selected on the next two tabs.
+5. **Active Learning** — run inference on the current video, get an
+   uncertainty heatmap on the timeline, jump to uncertain / least-confident
+   frames, relabel in place. Results are saved per video and restored.
+6. **Predict** — apply a model to unlabeled pose files in batch.
 
-Iterate by bumping the Iteration counter on the Pose tab: re-extract from the
-refined labels and retrain.
+Re-extracting after the labels change starts a new iteration automatically
+(the label signature differs); re-extracting unchanged labels is a redo.
+
+### How the pipeline tabs stay in sync
+
+`PipelinePanel` gets four calls from the main window — the Qt equivalent of
+the Electron plugin hooks — and keeps the expensive work out of the hot one:
+
+| call | when | does |
+|---|---|---|
+| `refresh()` | every label/behavior edit | video checklists only; **no backend calls** |
+| `on_video_switched()` | a video loads | re-inspect its pose file, restore/clear its predictions |
+| `on_project_opened()` | new/open/import | restore Pose/Train settings + iteration from the manifest |
+| `on_backend_ready()` | backend came up | retry pose inspection, rescan models |
+
+Settings that produced the features (origin, body parts, frame rate, …) live
+in the manifest's `preprocessing`; the Train tab's in `training`.
+
+### Positive class (binarize)
+
+Nothing ticked = multi-class; one = that behavior vs everything else; two or
+more = merged into `positive`. A binary model's classes are
+`[<positive>, "other"]` and **both are scored and refined** — its "other" is the
+negative class, not "unlabeled". With two classes a forest is always ≥ 0.5
+sure, so the Train tab warns when the confidence threshold is at that floor
+(the loop would stop after its seed round).
 
 ## Dev environment
 
@@ -93,16 +126,18 @@ pixi run -e gui python gui/run_all_tests.py
 ```
 
 Runs every `tests/test_*.py` suite headless (`QT_QPA_PLATFORM=offscreen`,
-synthetic videos via `tools/index_video.py`). Live pose extraction/training/
+synthetic videos via `tools/index_video.py`). On Linux, if the offscreen
+platform segfaults the first time a widget draws a non-ASCII glyph (e.g.
+`◀`), conda's fontconfig is reading the system's incompatible font cache:
+point `FONTCONFIG_FILE` at a fonts.conf with its own `<cachedir>`. Live pose extraction/training/
 inference (needing the backend's pixi/sklearn env) are not exercised by
 these — those paths are validated only at the contract level (stub HTTP
 server + config-dict building in `test_pipeline.py` / `test_backend_client.py`).
 
 ## Known gaps vs. the Electron app
 
-- `.rlt` single-file project export/import: `PoseProjectManager.export_rlt`/
-  `import_rlt`/`inspect_rlt` call the backend's existing `rlt_service`
-  endpoints, but there's no menu wiring for them yet.
+None in the pipeline tabs. `.rlt` export (labels-only or full package) and
+import are on the File menu.
 
 The splitter width (`QSettings` "splitterState") and the Active Learning stats
 grid (`AlState.stats`/`uncertain_segments` → `active_learning_panel`) were both

@@ -284,12 +284,46 @@ def test_active_learning_rejects_single_class():
         learner.run()
 
 
-def test_active_learning_rejects_ratio_that_seeds_nothing(learnable_dataset):
+def test_tiny_init_ratio_still_seeds_every_class(learnable_dataset):
+    """int(n * init_ratio) rounds to 0 for small classes; the seed must still
+    contain every class rather than dropping it (or raising)."""
     X, y = learnable_dataset
-    learner = RFActiveLearner(X, y, class_names=["a", "b", "other"],
-                              init_ratio=1e-9, max_iter=1)
-    with pytest.raises(ValueError, match="[Ii]nitial ratio"):
-        learner.run()
+    events = []
+    RFActiveLearner(X, y, class_names=["a", "b", "other"],
+                    init_ratio=1e-9, max_iter=1).run(progress_cb=events.append)
+    seed = next(e for e in events if e["event"] == "iteration")
+    assert seed["n_train"] == np.unique(y).size  # one sample per class
+
+
+def _sparse_labels(y, per_class=40):
+    """A few dozen labeled rows per behavior, everything else "other" (code 2)."""
+    rng = np.random.RandomState(0)
+    sparse = np.full_like(y, 2)
+    for c in (0, 1):
+        sparse[rng.choice(np.where(y == c)[0], per_class, replace=False)] = c
+    return sparse
+
+
+def test_sparse_labels_train_at_the_default_init_ratio(learnable_dataset):
+    """Real projects look like this. At the default init_ratio of 0.01 every
+    behavior used to round to zero seed samples, and training with
+    exclude_other failed outright."""
+    X, y = learnable_dataset
+    events = []
+    RFActiveLearner(X, _sparse_labels(y), class_names=["a", "b", "other"],
+                    init_ratio=0.01, conf_threshold=0.6, exclude_other=True,
+                    max_iter=30).run(progress_cb=events.append)
+    iterations = [e for e in events if e["event"] == "iteration"]
+    assert len(iterations) >= 2, "loop should refine, not stop on the seed"
+    assert iterations[-1]["macro_f1"] > 0.9
+
+
+def test_sparse_labels_with_other_seed_every_behavior(learnable_dataset):
+    """Without exclude_other this used to raise "seeds only one class"."""
+    X, y = learnable_dataset
+    result = RFActiveLearner(X, _sparse_labels(y), class_names=["a", "b", "other"],
+                             init_ratio=0.01, max_iter=1).run()
+    assert set(result.model.classes_) == {0, 1, 2}
 
 
 def test_exclude_other_drops_the_last_class(learnable_dataset):

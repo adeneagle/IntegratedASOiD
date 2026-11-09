@@ -7,7 +7,7 @@ the repo's own `backend/` FastAPI package on sys.path.
 from .client import BackendClient, BackendError
 from .config import BackendConfig
 from .manager import Backend
-from .process import BackendProcess, resolve_python
+from .process import BackendProcess, activation_path, resolve_python
 
 __all__ = [
     "Backend",
@@ -16,4 +16,5 @@ __all__ = [
     "BackendError",
     "BackendProcess",
     "resolve_python",
+    "activation_path",
 ]

@@ -25,6 +25,53 @@ def _pixi_env_python(root: Path) -> Path:
     return root / ".pixi" / "envs" / "default" / "bin" / "python"
 
 
+def _conda_prefix(python_path: str) -> Path | None:
+    """The conda/pixi environment prefix an interpreter belongs to, if any."""
+    exe = Path(python_path)
+    if not exe.is_absolute() or not exe.exists():
+        return None
+    prefix = exe.parent if os.name == "nt" else exe.parent.parent
+    return prefix if (prefix / "conda-meta").is_dir() else None
+
+
+def activation_path(python_path: str, base_path: str | None = None) -> str | None:
+    """`base_path` with the interpreter's conda/pixi env directories prepended.
+
+    Spawning `<env>/python.exe` directly is **not** the same as activating that
+    environment, and on Windows the difference is fatal rather than cosmetic:
+    conda-forge's numpy/scipy reach BLAS/LAPACK through DLLs in
+    `<env>\\Library\\bin`, resolved off PATH at call time. Without those entries
+    every import still succeeds — the failure lands only when the first LAPACK
+    routine actually runs, and it lands as a *hard* process crash
+    (`0xc06d007f`, DELAYLOAD_DLL_NOT_FOUND) with no Python traceback.
+
+    For this app that means feature extraction: `asoid_core.features.angle_between`
+    calls `np.linalg.det` on every body-part pair, so the backend dies part-way
+    through Extract Features and the GUI sees nothing but the connection
+    dropping. `pixi run test` never caught it because pixi activates first.
+
+    Returns None when the interpreter is not a conda-style env — there is then
+    nothing to prepend and PATH should be left alone.
+    """
+    prefix = _conda_prefix(python_path)
+    if prefix is None:
+        return None
+    if os.name == "nt":
+        # Same set, in the same order, that `pixi run` / `conda activate` prepend.
+        entries = [
+            prefix,
+            prefix / "Library" / "mingw-w64" / "bin",
+            prefix / "Library" / "usr" / "bin",
+            prefix / "Library" / "bin",
+            prefix / "Scripts",
+            prefix / "bin",
+        ]
+    else:
+        entries = [prefix / "bin"]
+    base = os.environ.get("PATH", "") if base_path is None else base_path
+    return os.pathsep.join([str(e) for e in entries] + ([base] if base else []))
+
+
 def resolve_python(config: BackendConfig) -> str:
     """Choose the interpreter to run the backend.
 
@@ -66,6 +113,11 @@ class BackendProcess:
             "--port", str(self.config.port), "--host", self.config.host,
         ]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        # Activate the interpreter's env for the child. See `activation_path`:
+        # without this the backend hard-crashes inside feature extraction.
+        activated = activation_path(python, env.get("PATH"))
+        if activated is not None:
+            env["PATH"] = activated
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(self.config.repo_root),

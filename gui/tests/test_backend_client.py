@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from labeling_shell.backend.client import BackendClient, BackendError  # noqa: E402
 from labeling_shell.backend.config import BackendConfig  # noqa: E402
-from labeling_shell.backend.process import resolve_python  # noqa: E402
+from labeling_shell.backend.process import activation_path, resolve_python  # noqa: E402
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -160,6 +160,52 @@ def test_resolve_python_precedence(tmp_path=None):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_activation_path_prepends_conda_env_dirs():
+    """A conda/pixi interpreter must have its env dirs prepended to the child PATH.
+
+    Regression guard: spawning `<env>/python.exe` unactivated leaves
+    `<env>/Library/bin` off PATH, and the backend then hard-crashes
+    (0xc06d007f) the first time numpy touches LAPACK — i.e. part-way through
+    feature extraction, with no traceback.
+    """
+    import tempfile
+    from pathlib import Path
+
+    env_root = Path(tempfile.mkdtemp()) / "envs" / "default"
+    (env_root / "conda-meta").mkdir(parents=True)
+    if os.name == "nt":
+        exe = env_root / "python.exe"
+        (env_root / "Library" / "bin").mkdir(parents=True)
+    else:
+        (env_root / "bin").mkdir(parents=True)
+        exe = env_root / "bin" / "python"
+    exe.write_text("")
+
+    # No drive letter: on POSIX the ":" in "C:\\..." is itself os.pathsep.
+    base = os.path.join(tempfile.gettempdir(), "pre-existing")
+    result = activation_path(str(exe), base)
+    assert result is not None, "conda-style env should produce a PATH"
+    entries = result.split(os.pathsep)
+    assert entries[-1] == base, "base PATH must be preserved, last"
+    if os.name == "nt":
+        assert entries[0] == str(env_root)
+        assert str(env_root / "Library" / "bin") in entries, \
+            "Library/bin carries the BLAS/LAPACK DLLs and must be on PATH"
+    else:
+        assert entries[0] == str(env_root / "bin")
+
+
+def test_activation_path_ignores_non_conda_interpreter():
+    """A bare/system interpreter has no env to activate — leave PATH untouched."""
+    import tempfile
+    from pathlib import Path
+
+    plain = Path(tempfile.mkdtemp()) / ("python.exe" if os.name == "nt" else "python")
+    plain.write_text("")
+    assert activation_path(str(plain), "BASE") is None
+    assert activation_path("python", "BASE") is None
 
 
 def _main() -> int:

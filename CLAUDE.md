@@ -69,7 +69,7 @@ jump-to-worst-frame and relabel strip all work as before.
 │   │   └── indexing.py        # feature-row <-> native-frame mapping
 │   ├── routers/           # pose, training, inference, project
 │   └── services/          # pose, training, inference, rlt
-└── tests/                 # pytest suite (140 tests)
+└── tests/                 # pytest suite (145 tests)
 ```
 
 ## Running the App
@@ -86,6 +86,17 @@ locally and tears it down on exit; `gui/labeling_shell/backend/process.py::resol
 resolves the interpreter: **`ASOID_PYTHON`/`PYTHON` override → project-local
 pixi env (`.pixi/envs/default/python.exe`) → bare `python`**. `GET /api/health`
 reports the interpreter plus numpy/sklearn/numba versions.
+
+**Spawning that interpreter is not the same as activating its environment.**
+`process.py::activation_path()` prepends the env's own directories (notably
+`<env>\Library\bin`) to the child's PATH before spawning. Skip that on Windows
+and conda-forge numpy/scipy cannot resolve the MKL BLAS/LAPACK DLLs — imports
+still succeed, and the process then dies with a bare `0xc06d007f`
+(DELAYLOAD_DLL_NOT_FOUND) and no traceback the moment something calls LAPACK.
+In practice that is `asoid_core.features.angle_between`'s `np.linalg.det`, so
+the symptom is the backend vanishing part-way through Extract Features.
+`pixi run test` cannot catch this class of bug, because pixi has already
+activated the env.
 
 Standalone backend: `pixi run backend`. Tests: `pixi run test` (backend),
 `pixi run -e gui python gui/run_all_tests.py` (frontend, headless).
@@ -229,6 +240,14 @@ Documented inline as `UPSTREAM FIX` comments in `backend/asoid_core/`:
    three coordinates per body part, so scaling an index by 2 made the kernels
    read misaligned slices. Combined with (2), upstream's 3D path cannot have
    produced a working model, so there was no numerical compatibility to preserve.
+4. **The active-learning seed takes at least one sample per class**
+   (`active_learning.py`). Upstream's `int(n * init_ratio)` is 0 for any class
+   with fewer than `1/init_ratio` training rows — under 100 at the default
+   0.01, which is typical for hand-labeled behaviors. Those classes were left
+   out of the seed entirely: training either failed ("seeds only one class") or
+   seeded on nearly all "other", which confidently predicted "other" for every
+   behavior sample, found nothing below `conf_threshold`, and "converged" at
+   round 0 with F1 ≈ 0. Only the cases where upstream dropped a class differ.
 
 The 2D path is otherwise arithmetically identical to upstream, so F1
 trajectories are comparable with the reference Streamlit app.
@@ -248,7 +267,16 @@ trajectories are comparable with the reference Streamlit app.
 - **Binarize**: a checklist of behaviors — 0 ticked = multi-class, 1 = binarize
   that behavior, ≥2 = union into one positive class. Handled by
   `training_service._collapse_labels`, mirroring the TSM app's semantics so
-  `mapLabelToModelClass` in the renderer still applies.
+  `mapLabelToModelClass` in the renderer still applies (it finds "other" by
+  name, so class order doesn't matter to it). The collapsed classes are
+  `[<positive>, "other"]` — **"other" last**, like everywhere else, because
+  `RFActiveLearner` treats the last code as "other". A binary run also passes
+  `has_other=False`: its "other" is the negative class, not "unlabeled", so it
+  must be scored and refined like the positive one (otherwise false positives
+  are invisible to F1). "Exclude other" on a binary run drops the *unlabeled*
+  rows before collapsing. With two classes the forest is always ≥ 0.5 sure, so
+  `conf_threshold` must exceed 0.5 for the loop to refine at all — the Train
+  tab warns.
 - **MKV / non-MP4 containers**: the frame-accurate WebCodecs path demuxes with
   mp4box (ISO/MP4 only), so other containers are remuxed to MP4 first. The pose
   file is unaffected — only the in-renderer decoder cares.
@@ -367,7 +395,7 @@ batch result re-imports as labels for review.
 ## Running Tests
 
 ```bash
-pixi run test                              # all 140
+pixi run test                              # all 145
 pixi run pytest tests/test_asoid_core.py   # single module
 ```
 

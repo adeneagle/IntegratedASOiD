@@ -116,10 +116,24 @@ def start_training(config: dict) -> str:
 
             binarize = config.get("binarize")
             label_union = config.get("label_union")
+            exclude_other = config.get("exclude_other", False)
+            has_other = True
             if binarize or label_union:
+                if exclude_other:
+                    # "Exclude other" means "don't train on unlabeled frames".
+                    # Once collapsed, "other" also holds every labeled negative,
+                    # so drop the unlabeled rows now, while they're still
+                    # distinguishable — excluding after the collapse would
+                    # discard the whole negative class.
+                    keep = targets != len(class_names) - 1
+                    features, targets = features[keep], targets[keep]
                 targets, class_names = _collapse_labels(
                     targets, class_names, binarize, label_union
                 )
+                # The collapsed "other" is the negative class of a binary
+                # problem, not "unlabeled": it has to be scored and refined
+                # like the positive one, or the model never learns to say no.
+                has_other = False
                 emit({
                     "status": "starting",
                     "message": f"Label space collapsed to: {', '.join(class_names)}",
@@ -141,7 +155,8 @@ def start_training(config: dict) -> str:
                 max_iter=config.get("max_iter", 100),
                 max_samples_iter=config.get("max_samples_iter", 20),
                 conf_threshold=config.get("conf_threshold", 0.5),
-                exclude_other=config.get("exclude_other", False),
+                exclude_other=exclude_other,
+                has_other=has_other,
             )
 
             def progress_cb(payload):
@@ -216,13 +231,18 @@ def start_training(config: dict) -> str:
 
 
 def _collapse_labels(targets, class_names, binarize, label_union):
-    """Collapse the label space to ['other', <positive>].
+    """Collapse the label space to [<positive>, 'other'].
 
     Mirrors the TSM app's binarize/label_union semantics so the renderer's
     existing behavior checklist keeps working, and so `mapLabelToModelClass` in
     the Active Learning panel still describes what the model predicts:
     zero behaviors checked = multi-class, one = binarize that behavior,
     two or more = union them into a single positive class first.
+
+    "other" stays the *last* code, as everywhere else: RFActiveLearner treats
+    the last class as "other" — never scored, never drawn for refinement. With
+    "other" first, a binarized run scored F1 on the negative class and drew
+    its active-learning samples from the wrong pool.
     """
     positives = list(label_union or [])
     if binarize and binarize not in positives:
@@ -235,8 +255,8 @@ def _collapse_labels(targets, class_names, binarize, label_union):
     if not codes:
         return targets, class_names
 
-    collapsed = np.where(np.isin(targets, list(codes)), 1, 0)
-    return collapsed.astype(int), ["other", positive_name]
+    collapsed = np.where(np.isin(targets, list(codes)), 0, 1)
+    return collapsed.astype(int), [positive_name, "other"]
 
 
 # ── Metrics / lifecycle (unchanged contract) ───────────────────────────────
@@ -345,6 +365,9 @@ def list_checkpoints(search_dirs: list[str] | None = None) -> list[dict]:
                         "frames2integ": bundle.get("frames2integ"),
                         "video_ids": bundle.get("video_ids"),
                         "trained_at": bundle.get("trained_at"),
+                        # binarize/label_union: the AL panel needs them to map a
+                        # behavior name into a binarized model's label space.
+                        "config": bundle.get("config"),
                     })
                     if bundle.get("iteration"):
                         entry["iteration"] = bundle["iteration"]

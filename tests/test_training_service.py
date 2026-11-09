@@ -112,7 +112,39 @@ def test_binarize_collapses_the_label_space(extracted_project):
     task = training_service.get_task(task_id)
     assert status == "completed", task.get("error")
     bundle = joblib.load(task["checkpoint_path"])
-    assert bundle["class_names"] == ["other", "rearing"]
+    # "other" stays last: RFActiveLearner treats the last code as "other".
+    assert bundle["class_names"] == ["rearing", "other"]
+
+
+def test_binarize_scores_the_positive_class(extracted_project):
+    """Regression: with "other" first, F1 was computed on the negative class."""
+    task_id, status = _train(extracted_project, binarize="rearing")
+    assert status == "completed", training_service.get_task(task_id).get("error")
+    events = training_service.read_all_metrics(task_id)
+    iters = [e for e in events if e.get("event") == "iteration"]
+    # Both sides of a binary problem are scored: the negatives are a real
+    # class here, not "unlabeled" — otherwise false positives are invisible.
+    assert len(iters[-1]["f1_per_class"]) == 2
+    assert iters[-1]["macro_f1"] > 0.8
+
+
+def test_binarize_with_exclude_other_keeps_labeled_negatives(extracted_project):
+    """Regression: excluding "other" after the collapse dropped every labeled
+    negative too, leaving one class and a ValueError."""
+    task_id, status = _train(extracted_project, binarize="rearing", exclude_other=True)
+    task = training_service.get_task(task_id)
+    assert status == "completed", task.get("error")
+    assert joblib.load(task["checkpoint_path"])["class_names"] == ["rearing", "other"]
+
+
+def test_list_checkpoints_reports_the_training_config(extracted_project):
+    """The AL panel maps behavior names into a binarized model's label space from
+    this, so a model picked from the project list is interpreted correctly."""
+    task_id, status = _train(extracted_project, binarize="rearing")
+    assert status == "completed"
+    found = training_service.list_checkpoints([extracted_project])
+    assert found[0]["config"]["binarize"] == "rearing"
+    assert found[0]["class_names"] == ["rearing", "other"]
 
 
 def test_label_union_merges_behaviors_into_one_positive_class(extracted_project):
@@ -120,7 +152,7 @@ def test_label_union_merges_behaviors_into_one_positive_class(extracted_project)
     task = training_service.get_task(task_id)
     assert status == "completed", task.get("error")
     bundle = joblib.load(task["checkpoint_path"])
-    assert bundle["class_names"] == ["other", "positive"]
+    assert bundle["class_names"] == ["positive", "other"]
 
 
 def test_training_errors_on_missing_features(tmp_path):
