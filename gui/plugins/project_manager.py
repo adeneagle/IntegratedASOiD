@@ -17,6 +17,7 @@ file names on disk) and independently reimplemented here, not inherited.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -126,10 +127,53 @@ class PoseProjectManager(ProjectStore):
         entry = self.get_video_entry(video_id)
         return entry.get("frame_count") if entry else None
 
-    def remove_video(self, video_id: str) -> None:
+    def list_videos(self) -> list:
+        """Copies of the registered video records, in the order they were added."""
+        return [dict(v) for v in self.manifest.get("videos", []) or []]
+
+    def relink_video(self, video_id: str, path) -> None:
+        """Point an existing entry at a new file, keeping its id (so its labels,
+        pose file and features)."""
+        entry = self.get_video_entry(video_id)
+        if entry is not None:
+            entry["path"] = str(path)
+            self.flush_manifest()
+
+    def relink_missing_in(self, folder) -> list:
+        """Relink every video that can't be found to a same-named file in
+        `folder` — one moved video usually means the whole batch moved.
+        Returns the ids fixed."""
+        fixed = []
+        for v in self.list_videos():
+            path = v.get("path") or ""
+            if path and os.path.exists(path):
+                continue
+            name = re.split(r"[\\/]", path)[-1] if path else ""
+            cand = os.path.join(str(folder), name)
+            if name and os.path.isfile(cand):
+                self.relink_video(v["id"], cand)
+                fixed.append(v["id"])
+        return fixed
+
+    def remove_video(self, video_id: str, delete_data: bool = False) -> None:
+        """Drop a video from the project. The video file itself is never touched.
+
+        By default its labels and saved predictions stay on disk, so adding the
+        same video back restores them; `delete_data` removes them too. Features
+        under iteration-N/ are left alone — they're part of that iteration's
+        record of what a model was trained on.
+        """
+        if not str(video_id or "").strip():
+            raise ValueError("empty video id")
         m = self.manifest
         m["videos"] = [v for v in m.get("videos", []) if v.get("id") != video_id]
-        self.save_manifest()
+        if m.get("last_video") == video_id:
+            m.pop("last_video")
+        self.flush_manifest()
+        if delete_data:
+            for p in (self.labels_dir / f"{video_id}.json", self.label_csv_path(video_id),
+                      self.predictions_dir() / f"{video_id}.json"):
+                p.unlink(missing_ok=True)
 
     # -------------------------------------------------------------- behaviors
     def update_behaviors(self, behaviors) -> None:

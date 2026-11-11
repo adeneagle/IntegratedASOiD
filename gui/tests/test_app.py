@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from labeling_shell.behaviors_panel import BehaviorsPanel  # noqa: E402
 from labeling_shell.bouts import Bout, LabelModel  # noqa: E402
@@ -204,6 +204,151 @@ def test_new_project_adopts_the_open_video_and_its_labels():
         assert len(win.project.load_into_model(vid).bouts) == 1
         assert "p" in win.windowTitle()
         win.player.reader.close()
+
+
+def _patched(obj, name, value):
+    """Context manager: temporarily replace obj.name (dialogs in a headless test)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        orig = getattr(obj, name)
+        setattr(obj, name, value)
+        try:
+            yield
+        finally:
+            setattr(obj, name, orig)
+    return cm()
+
+
+def _project_with_videos(win, d, names, n_frames=30):
+    proj = os.path.join(d, "proj")
+    win.project = PoseProjectManager(proj)
+    win.project.create("t")
+    paths = []
+    for name in names:
+        p = os.path.join(d, name)
+        write_index_video(p, n_frames, fps=30, gop=12)
+        paths.append(p)
+    return paths
+
+
+def test_add_videos_registers_several_and_lists_them():
+    from PySide6 import QtWidgets
+    _app()
+    from app import MainWindow
+    win = MainWindow(autostart_backend=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        paths = _project_with_videos(win, d, ["a.mp4", "b.mp4", "c.mp4"], n_frames=40)
+        with _patched(QtWidgets.QFileDialog, "getOpenFileNames",
+                      staticmethod(lambda *a, **k: (paths, ""))):
+            win.open_video()
+
+        ids = [v["id"] for v in win.project.list_videos()]
+        assert ids == ["a", "b", "c"]
+        # Frame counts are known without opening — extraction clips pose to them.
+        assert [win.project.get_video_frame_count(i) for i in ids] == [40, 40, 40]
+        assert win.current_video_id == "a"  # the first one is opened
+        assert win.videos_panel.list.count() == 3
+        status = win.videos_panel.list.item(1).data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        assert status and status[0] == "no pose file"
+
+        # Adding the same files again changes nothing.
+        with _patched(QtWidgets.QFileDialog, "getOpenFileNames",
+                      staticmethod(lambda *a, **k: (paths[1:], ""))):
+            win.open_video()
+        assert [v["id"] for v in win.project.list_videos()] == ["a", "b", "c"]
+        win.player.unload()
+
+
+def test_switching_videos_keeps_labels_per_video():
+    _app()
+    from app import MainWindow
+    win = MainWindow(autostart_backend=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        paths = _project_with_videos(win, d, ["a.mp4", "b.mp4"])
+        win.add_project_videos(paths)
+        win.open_project_video("a")
+        win.behaviors_panel.add_behavior("groom")
+        win._seek(2)
+        win._handle_key("1", 0)
+        win._seek(6)
+        win._handle_key("1", 0)
+
+        win.videos_panel.videoRequested.emit("b")  # click the second row
+        assert win.current_video_id == "b"
+        assert win.model.bouts == []
+        assert [b.name for b in win.model.behaviors] == ["groom"]  # behaviors are global
+
+        win.open_project_video("a")
+        assert [(b.start_frame, b.end_frame) for b in win.model.bouts] == [(2, 6)]
+        win.player.unload()
+
+
+def test_remove_open_video_unloads_it_and_can_keep_or_delete_labels():
+    from PySide6 import QtWidgets
+    _app()
+    from app import MainWindow
+    win = MainWindow(autostart_backend=False)
+    ok = QtWidgets.QMessageBox.StandardButton.Ok
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        paths = _project_with_videos(win, d, ["a.mp4", "b.mp4"])
+        win.add_project_videos(paths)
+        for vid in ("a", "b"):
+            win.open_project_video(vid)
+            if not win.model.behaviors:
+                win.behaviors_panel.add_behavior("groom")
+            win._seek(1)
+            win._handle_key("1", 0)
+            win._seek(3)
+            win._handle_key("1", 0)
+
+        # Remove the open one, keeping its labels.
+        with _patched(QtWidgets.QMessageBox, "exec", lambda self: ok):
+            win.remove_project_video("b")
+        assert [v["id"] for v in win.project.list_videos()] == ["a"]
+        assert win.current_video_id is None and win.player.reader is None
+        assert (win.project.labels_dir / "b.json").exists()
+        assert win.project.manifest.get("last_video") != "b"
+
+        # Remove the other, ticking "also delete its labels".
+        def tick_and_ok(box):
+            box.checkBox().setChecked(True)
+            return ok
+        with _patched(QtWidgets.QMessageBox, "exec", tick_and_ok):
+            win.remove_project_video("a")
+        assert win.project.list_videos() == []
+        assert not (win.project.labels_dir / "a.json").exists()
+        assert not win.project.label_csv_path("a").exists()
+        assert os.path.exists(paths[0]), "the video file itself is never deleted"
+
+
+def test_locating_a_moved_video_relinks_it_and_its_neighbours():
+    import shutil
+    _app()
+    from app import MainWindow
+    win = MainWindow(autostart_backend=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        paths = _project_with_videos(win, d, ["a.mp4", "b.mp4"])
+        win.add_project_videos(paths)
+        win.player.unload()
+        win.current_video_id = None
+        moved = os.path.join(d, "moved")
+        os.makedirs(moved)
+        for p in paths:
+            shutil.move(p, moved)
+
+        from PySide6 import QtWidgets
+        new_a = os.path.join(moved, "a.mp4")
+        with _patched(QtWidgets.QMessageBox, "information", staticmethod(lambda *a, **k: None)), \
+                _patched(QtWidgets.QFileDialog, "getOpenFileName",
+                         staticmethod(lambda *a, **k: (new_a, ""))):
+            win.open_project_video("a")
+        assert win.current_video_id == "a"
+        assert win.project.get_video_entry("a")["path"] == new_a
+        # b moved with it, so it was relinked too.
+        assert win.project.get_video_entry("b")["path"] == os.path.join(moved, "b.mp4")
+        win.player.unload()
 
 
 def test_mainwindow_pipeline_tabs_present():

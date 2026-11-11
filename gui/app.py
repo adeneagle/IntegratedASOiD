@@ -32,7 +32,9 @@ from labeling_shell.csv_io import (  # noqa: E402
 from labeling_shell.active_learning import hud_info  # noqa: E402
 from labeling_shell.theme import apply_theme  # noqa: E402
 from labeling_shell.timeline_widget import UncertaintyTimeline  # noqa: E402
+from labeling_shell.video_reader import probe_frame_count  # noqa: E402
 from labeling_shell.video_widget import PlayerWidget  # noqa: E402
+from labeling_shell.videos_panel import VideosPanel  # noqa: E402
 from plugins.pipeline_panel import PipelinePanel  # noqa: E402
 from plugins.pose_overlay import PoseOverlay  # noqa: E402
 from plugins.project_manager import PoseProjectManager, sanitize_id  # noqa: E402
@@ -62,11 +64,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.behaviors_panel.changed.connect(self._on_model_changed)
         self.bouts_panel.changed.connect(self._on_model_changed)
         self.bouts_panel.seekRequested.connect(self._seek)
+        self.videos_panel = VideosPanel()
+        self.videos_panel.videoRequested.connect(self.open_project_video)
+        self.videos_panel.addRequested.connect(self.open_video)
+        self.videos_panel.removeRequested.connect(self.remove_project_video)
+        self.videos_panel.locateRequested.connect(
+            lambda vid: self.open_project_video(vid, locate=True))
         self.pipeline = PipelinePanel(self)  # MainWindow is the pipeline ctx
         self.pipeline.pose.selectionChanged.connect(self._on_pose_selection_changed)
 
         label_tab = QtWidgets.QWidget()
         ll = QtWidgets.QVBoxLayout(label_tab)
+        ll.addWidget(self.videos_panel)
         ll.addWidget(self.behaviors_panel, 1)
         ll.addWidget(self.bouts_panel, 2)
 
@@ -159,9 +168,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bouts_panel.model = self.model
 
     def _refresh_all(self) -> None:
+        self.videos_panel.set_videos(
+            self.project.list_videos() if self.project else [],
+            self.current_video_id, self.video_statuses())
         self.behaviors_panel.refresh()
         self.bouts_panel.refresh()
         self.pipeline.refresh()
+
+    def video_statuses(self) -> dict:
+        """{video id: (text, color, tooltip)} for the line under each video's
+        name: how far it has got through the pipeline."""
+        if not self.project:
+            return {}
+        pose_tab = self.pipeline.pose
+        iteration = pose_tab.current_iteration_dir()
+        out = {}
+        for v in self.project.list_videos():
+            vid = v.get("id")
+            if not pose_tab.pose_path_for(vid):
+                out[vid] = ("no pose file", "#8b949e",
+                            "Open this video, then attach its pose file on the Pose tab.")
+            elif os.path.exists(self.project.get_video_features_abs(vid, iteration)):
+                out[vid] = (f"features in {iteration}", "#3fb950", "")
+            else:
+                out[vid] = ("pose attached", "#d29922",
+                            f"No features in {iteration} yet — Extract features on the Pose tab.")
+        return out
 
     def _seek(self, frame: int) -> None:
         self.player._show(frame)
@@ -319,20 +351,151 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hud.show()
 
     # ------------------------------------------------------------------ video
-    def open_video(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open video", "",
-            "Videos (*.mp4 *.mkv *.avi *.webm *.mov);;All files (*)")
-        if path:
-            self.load_video(path)
+    VIDEO_FILTER = "Videos (*.mp4 *.mkv *.avi *.webm *.mov);;All files (*)"
 
-    def load_video(self, path: str) -> None:
+    def open_video(self) -> None:
+        """Pick one or more videos. In a project they are all added to it and the
+        first is opened; without one, only a single video can be open."""
+        start = ""
+        if self._video_path:
+            start = os.path.dirname(self._video_path)
+        elif self.project:
+            start = str(self.project.root.parent)
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add videos" if self.project else "Open video", start, self.VIDEO_FILTER)
+        if not paths:
+            return
+        if not self.project:
+            if len(paths) > 1:
+                QtWidgets.QMessageBox.information(
+                    self, "One video without a project",
+                    "To work with several videos, create a project first "
+                    "(File ▸ New Project) — the open video is adopted into it.\n\n"
+                    f"Opening {Path(paths[0]).name} for now.")
+            self.load_video(paths[0])
+            return
+        first = self.add_project_videos(paths)
+        if first:
+            self.load_video(first[1], first[0])
+
+    def add_project_videos(self, paths) -> tuple | None:
+        """Register videos with the project without opening them. Returns
+        (id, path) of the first one to open, or None if nothing was added.
+
+        The frame count is read from container metadata now (cheap), because
+        feature extraction clips each pose file to its video's length — an
+        unknown count would extract the whole pose file. Opening the video
+        replaces it with the exact count.
+        """
+        known = {v["id"]: v for v in self.project.list_videos()}
+        added, clashes, first = [], [], None
+        for path in paths:
+            name = Path(path).name
+            vid = sanitize_id(name)
+            rec = known.get(vid)
+            if rec and os.path.normcase(os.path.abspath(rec.get("path") or "")) \
+                    != os.path.normcase(os.path.abspath(path)) \
+                    and os.path.exists(rec.get("path") or ""):
+                # Same file name from another folder: its labels would be shared.
+                clashes.append(name)
+                continue
+            if rec is None:
+                self.project.register_video(vid, name, path, probe_frame_count(path))
+                known[vid] = {"id": vid, "path": path}
+                added.append(name)
+            elif rec.get("path") != path:
+                self.project.relink_video(vid, path)  # it moved; same video
+            if first is None:
+                first = (vid, path)
+        if clashes:
+            QtWidgets.QMessageBox.warning(
+                self, "Name already used",
+                "The project already has a different video with the same file name, "
+                "so these were skipped (labels are kept per file name):\n\n"
+                + "\n".join(clashes))
+        self._refresh_all()
+        if added:
+            self._status(f"Added {len(added)} video(s) to the project.")
+        return first
+
+    def open_project_video(self, video_id: str, locate: bool = False) -> None:
+        """Open a video from the project list, asking where it went if it moved.
+        `locate` asks for a file even when the recorded one exists (Locate File…)."""
+        if not self.project or (video_id == self.current_video_id and not locate):
+            return
+        rec = self.project.get_video_entry(video_id)
+        if rec is None:
+            return
+        path = rec.get("path") or ""
+        if locate or not os.path.exists(path):
+            if not locate:
+                QtWidgets.QMessageBox.information(
+                    self, "Video not found",
+                    f"{rec.get('name') or video_id} is no longer at\n{path}\n\n"
+                    "Locate it to continue.")
+            old_dir = os.path.dirname(path)
+            start = old_dir if old_dir and os.path.isdir(old_dir) else str(self.project.root.parent)
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, f"Locate {rec.get('name') or video_id}", start, self.VIDEO_FILTER)
+            if not path:
+                self._refresh_all()  # drop the list selection back to the open video
+                return
+            self.project.relink_video(video_id, path)
+            others = [v for v in self.project.relink_missing_in(os.path.dirname(path))
+                      if v != video_id]
+            if others:
+                self._status(f"Also relinked {len(others)} other video(s) found in "
+                             f"{os.path.dirname(path)}.")
+        self.load_video(path, video_id)
+
+    def remove_project_video(self, video_id: str) -> None:
+        """Drop a video from the project after confirming (the file stays put)."""
+        if not self.project:
+            return
+        rec = self.project.get_video_entry(video_id)
+        if rec is None:
+            return
+        name = rec.get("name") or video_id
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Remove video")
+        box.setText(f"Remove {name} from the project?")
+        box.setInformativeText("The video file itself is not deleted. Its labels are "
+                               "kept unless you tick the box, so adding it back "
+                               "restores them.")
+        delete_chk = QtWidgets.QCheckBox("Also delete its labels and saved predictions")
+        box.setCheckBox(delete_chk)
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok
+                               | QtWidgets.QMessageBox.StandardButton.Cancel)
+        if box.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+            self._refresh_all()
+            return
+        delete_data = delete_chk.isChecked()
+        if video_id == self.current_video_id:
+            self._autosave()
+            self.player.unload()
+            self.pose_overlay.invalidate()
+            self.current_video_id = self._video_path = None
+            self.model = LabelModel()
+            self.model.behaviors = [Behavior(**b) for b in
+                                    self.project.manifest.get("behaviors", [])]
+            self._rebind_model()
+            self.set_al_results(None)
+        self.project.remove_video(video_id, delete_data=delete_data)
+        self._refresh_all()
+        self.pipeline.on_video_switched()
+        self._update_title()
+        self._status(f"Removed {name} from the project"
+                     + (" and deleted its labels." if delete_data else "."))
+
+    def load_video(self, path: str, video_id: str | None = None) -> None:
         self._autosave()
         self.pose_overlay.invalidate()
         self.player.load(path)
         self._video_path = path
         name = Path(path).name
-        self.current_video_id = sanitize_id(name)
+        # An explicit id keeps a relinked video (possibly renamed on disk)
+        # attached to its labels.
+        self.current_video_id = video_id or sanitize_id(name)
         if self.project:
             self.model = self.project.load_into_model(self.current_video_id)
             self._rebind_model()
@@ -472,10 +635,10 @@ class MainWindow(QtWidgets.QMainWindow):
         candidates = sorted(videos, key=lambda v: v.get("id") != last)
         for v in candidates:
             if v.get("path") and os.path.exists(v["path"]):
-                self.load_video(v["path"])
+                self.load_video(v["path"], v.get("id"))
                 break
         self._status(f"Opened project {store.manifest.get('name')} — {len(videos)} video(s); "
-                     f"switch with File ▸ Project Videos.")
+                     f"switch on the Label tab's Videos list.")
 
     def _set_project(self, store: PoseProjectManager) -> None:
         """Make `store` the active project with no video loaded from it yet."""
@@ -506,11 +669,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if v.get("id") == self.current_video_id:
                 label = "● " + label
             act = self.videos_menu.addAction(label)
-            if path and os.path.exists(path):
-                act.triggered.connect(lambda _c=False, p=path: self.load_video(p))
-            else:
-                act.setText(label + "  (file not found)")
-                act.setEnabled(False)
+            if not (path and os.path.exists(path)):
+                act.setText(label + "  (file not found — click to locate)")
+            act.triggered.connect(
+                lambda _c=False, vid=v.get("id"): self.open_project_video(vid))
 
     # ------------------------------------------------------------------- rlt
     def export_rlt(self) -> None:

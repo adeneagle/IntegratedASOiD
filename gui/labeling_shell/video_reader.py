@@ -233,3 +233,26 @@ class VideoReader:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def probe_frame_count(path) -> int | None:
+    """Frame count from container metadata alone — no demux pass, so it's cheap
+    enough to run on a batch of videos being added to a project.
+
+    Uses the stream's declared frame count, else duration x average rate (MKV
+    and some AVIs declare no count). Approximate in that case; opening the video
+    replaces it with the exact count from VideoReader. None if unreadable.
+    """
+    try:
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            if stream.frames and stream.frames > 0:
+                return int(stream.frames)
+            rate = stream.average_rate or stream.guessed_rate
+            if stream.duration and stream.time_base and rate:
+                return int(round(float(stream.duration * stream.time_base) * float(rate)))
+            if container.duration and rate:
+                return int(round(container.duration / av.time_base * float(rate)))
+    except Exception:  # noqa: BLE001 - unreadable/odd files just stay unknown
+        pass
+    return None

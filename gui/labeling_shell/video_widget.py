@@ -118,6 +118,20 @@ class PlayerWidget(QtWidgets.QWidget):
         self.slider.setRange(0, max(0, self.reader.num_frames - 1))
         self._show(0)
 
+    def unload(self) -> None:
+        """Close the current video and show an empty player."""
+        self.pause()
+        if self.reader is not None:
+            self.reader.close()
+        self.reader = None
+        self.index = 0
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, 0)
+        self.slider.blockSignals(False)
+        self.slider.setEnabled(False)
+        self.view.set_frame(None)
+        self._update_info()
+
     # -------------------------------------------------------------- transport
     def toggle_play(self) -> None:
         self.pause() if self._timer.isActive() else self.play()

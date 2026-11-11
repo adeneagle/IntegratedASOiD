@@ -33,6 +33,7 @@ app.py                        MainWindow, entry point — the pipeline ctx
 labeling_shell/                shell, copied from RealtimeASOID-python (generic):
   bouts.py, csv_io.py, project.py    label model, CSV I/O, on-disk ProjectStore
   video_reader.py, video_widget.py   PyAV decoding + Qt video display/transport
+  videos_panel.py                    the project's video list (from B-REAL)
   timeline_widget.py, active_learning.py   uncertainty timeline, AlState
   theme.py, theme.qss                Qt dark theme
   backend/{client,manager,process,config}.py   HTTP/SSE seam to backend/
@@ -59,8 +60,14 @@ tools/index_video.py            synthetic frame-indexed test videos
 ## Workflow
 
 1. **Project** — File ▸ New Project (a video already open is adopted, labels
-   and all). Reopening a project loads the video you last worked on; switch
-   with File ▸ Project Videos.
+   and all). The **Videos** list at the top of the Label tab holds the
+   project's videos: **Add Videos…** takes several files at once, clicking a
+   row switches to it (labels are kept per video, behaviors are shared),
+   **Remove** drops one from the project (optionally with its labels — never
+   the file), and right-click ▸ **Locate File…** relinks one that moved, plus
+   any others found in the same folder. Each row shows how far that video has
+   got: no pose file / pose attached / features in the current iteration.
+   Reopening a project loads the video you last worked on.
 2. **Label** — define behaviors, mark temporal bouts (keys `1`–`0`).
 3. **Pose** — attach the video's pose file. Body parts default to all; the
    tab shows the feature width and bin size, warns if the pose file and video
