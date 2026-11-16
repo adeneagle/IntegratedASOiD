@@ -59,6 +59,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.player = PlayerWidget()
         self.player.frameChanged.connect(self._on_frame)
         self.player.snapBackRequested.connect(self.snap_back)
+        self.player.readFailed.connect(
+            lambda msg: self.statusBar().showMessage(msg, 15000))
         self.behaviors_panel = BehaviorsPanel(self.model)
         self.bouts_panel = BoutsPanel(self.model, self._fps)
         self.behaviors_panel.changed.connect(self._on_model_changed)

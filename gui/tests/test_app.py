@@ -351,6 +351,64 @@ def test_locating_a_moved_video_relinks_it_and_its_neighbours():
         win.player.unload()
 
 
+def _einval():
+    import av
+    # What Windows reports through FFmpeg when a network share's handle dies.
+    return av.error.ArgumentError(22, "Invalid argument", "//server/share/video.mp4")
+
+
+def test_reader_recovers_when_the_file_handle_dies():
+    """Reads on a dead handle (SMB reconnect on Windows) fail with EINVAL every
+    time; the reader must reopen the file and carry on."""
+    from labeling_shell.video_reader import VideoReader
+    from tools.index_video import read_index_frame
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        path = os.path.join(d, "clip.mp4")
+        write_index_video(path, 40, fps=30, gop=12)
+        r = VideoReader(path)
+        r.get_frame(3)
+        real_decode, calls = r._decode, []
+
+        def dead_handle_once(index):
+            calls.append(index)
+            if len(calls) == 1:
+                raise _einval()
+            return real_decode(index)
+        r._decode = dead_handle_once
+        arr = r.get_frame(25)
+        assert read_index_frame(arr) == 25
+        assert calls == [25, 25], "retried once on a fresh handle"
+        r.close()
+
+
+def test_unreadable_frame_is_reported_not_raised():
+    _app()
+    from labeling_shell.video_reader import VideoReadError
+    from labeling_shell.video_widget import PlayerWidget
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        path = os.path.join(d, "clip.mp4")
+        write_index_video(path, 40, fps=30, gop=12)
+        player = PlayerWidget()
+        player.load(path)
+        messages = []
+        player.readFailed.connect(messages.append)
+
+        def always_fails(index):
+            raise _einval()
+        player.reader._decode = always_fails
+        player.reader._reopen = lambda: None
+        player._show(30)  # must not raise
+        assert messages and "frame 30" in messages[0]
+        assert player.index == 0, "stays on the last good frame"
+        assert "could not read" in player.info.text()
+        try:
+            player.reader.get_frame(31)
+            raise AssertionError("expected VideoReadError")
+        except VideoReadError:
+            pass
+        player.unload()
+
+
 def test_mainwindow_pipeline_tabs_present():
     _app()
     from app import MainWindow

@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .qt_image import ndarray_to_qimage
 from .theme import mark_ghost
 from .timefmt import format_time
-from .video_reader import VideoReader
+from .video_reader import VideoReader, VideoReadError
 
 
 class VideoView(QtWidgets.QWidget):
@@ -66,6 +66,9 @@ class PlayerWidget(QtWidgets.QWidget):
     # The player has no view of the label model, so it asks the host to work out
     # where "back" is (the end of the last bout) and seek there.
     snapBackRequested = QtCore.Signal()
+    # A frame could not be decoded (message for the status bar). Playback
+    # stops; the last good frame stays on screen.
+    readFailed = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -181,8 +184,15 @@ class PlayerWidget(QtWidgets.QWidget):
         if self.reader is None:
             return
         index = max(0, min(index, self.reader.num_frames - 1))
+        try:
+            arr = self.reader.get_frame(index)
+        except (VideoReadError, RuntimeError) as e:
+            self.pause()
+            self.info.setText(f"⚠ could not read frame {index} — see status bar")
+            self.readFailed.emit(f"Could not read frame {index}: {e}")
+            return
         self.index = index
-        self.view.set_frame(self.reader.get_frame(index))
+        self.view.set_frame(arr)
         self.slider.blockSignals(True)
         self.slider.setValue(index)
         self.slider.blockSignals(False)

@@ -34,6 +34,10 @@ import av
 import numpy as np
 
 
+class VideoReadError(RuntimeError):
+    """A frame could not be decoded, even after reopening the file."""
+
+
 class VideoReader:
     """Open a video and read any frame by integer display-order index.
 
@@ -45,12 +49,7 @@ class VideoReader:
 
     def __init__(self, path, cache_size: int = 300):
         self.path = str(path)
-        self._container = av.open(self.path)
-        if not self._container.streams.video:
-            self._container.close()
-            raise ValueError(f"no video stream in {self.path!r}")
-        self._stream = self._container.streams.video[0]
-        self._stream.thread_type = "AUTO"  # let libav use frame/slice threading
+        self._open_container()
         self._time_base = self._stream.time_base  # Fraction: seconds per pts unit
 
         # Display-order index: pts of every frame + whether it is a keyframe.
@@ -68,6 +67,30 @@ class VideoReader:
         # frame stepping) does not re-seek on every frame.
         self._gen = None
         self._gen_pos: int | None = None
+
+    def _open_container(self) -> None:
+        self._container = av.open(self.path)
+        if not self._container.streams.video:
+            self._container.close()
+            raise ValueError(f"no video stream in {self.path!r}")
+        self._stream = self._container.streams.video[0]
+        self._stream.thread_type = "AUTO"  # let libav use frame/slice threading
+
+    def _reopen(self) -> None:
+        """Close and reopen the file, keeping the frame index (same file).
+
+        A video on a network share can have its open handle invalidated under
+        it — on Windows, an SMB reconnect does this — and every read after that
+        fails (FFmpeg reports EINVAL, "Invalid argument ... returned 22") even
+        though the file is fine. A fresh handle reads it again.
+        """
+        try:
+            self._container.close()
+        except Exception:  # noqa: BLE001 - the old handle may already be dead
+            pass
+        self._open_container()
+        self._gen = None
+        self._gen_pos = None
 
     # ------------------------------------------------------------------ index
     def _build_index(self) -> None:
@@ -193,6 +216,21 @@ class VideoReader:
             self._cache.move_to_end(index)
             return cached
 
+        try:
+            return self._decode(index)
+        except Exception:  # noqa: BLE001 - FFmpeg errors, OSError, PyAV's closed-container assert
+            # Most often a network share dropping the open handle (see _reopen).
+            # One retry on a fresh handle; a second failure is real.
+            try:
+                self._reopen()
+                return self._decode(index)
+            except Exception as e:  # noqa: BLE001
+                self._gen = None
+                self._gen_pos = None
+                raise VideoReadError(
+                    f"could not read frame {index} of {self.path}: {e}") from e
+
+    def _decode(self, index: int) -> np.ndarray:
         # Fast path: continue the current forward decode for small forward jumps.
         if self._gen_pos is not None and self._gen_pos <= index <= self._gen_pos + 120:
             arr = self._advance_gen_to(index)
